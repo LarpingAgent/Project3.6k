@@ -21,7 +21,12 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 
 - **NOT VERIFIED BY AUTOMATION** — Confirm the forest ridge remains behind the trees even though its indexed draw range is submitted after them; resize repeatedly and confirm the depth image recreates without flicker or stale occlusion.
 
+## Phase 3e texture
+
+- **NOT VERIFIED BY AUTOMATION** — Confirm the forest's repeating noise texture is visibly sampled and vertex colors tint it without unexpected color shifts, missing faces, or obvious seams.
+- **NOT VERIFIED BY AUTOMATION** — Move and rotate the camera across near/far geometry and resize repeatedly; confirm texture filtering changes smoothly with distance and texture sampling remains stable after swapchain recreation.
+
 ## Future renderer milestones
 
-- Add checks for texture appearance and lighting when those features exist.
+- Add checks for basic lighting and shading when that feature exists.
 - Add checks for the final forest demo's visual quality and behavior on a second Vulkan-capable GPU when one is available.

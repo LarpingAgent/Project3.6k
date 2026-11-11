@@ -11,7 +11,7 @@ Project3.6k is a custom Rust engine foundation for a future first-person forest 
 - Debug builds require `VK_LAYER_KHRONOS_validation`; the callback counts and logs warnings/errors and makes the process fail if any occur.
 - Monotonic frame timing and structured `tracing` logs.
 
-The renderer currently shows a static vertex-colored planar forest composition using indexed triangles, transformed by a first-person perspective camera and depth tested across separate draw ranges. Textures, lighting, and gameplay are still future work.
+The renderer currently shows a static planar forest composition using indexed triangles, a first-person perspective camera, per-swapchain depth testing, and an embedded repeating sRGB noise texture with CPU-generated mipmaps. Vertex colors tint the texture. Lighting and gameplay are still future work.
 
 ## Requirements
 
@@ -41,7 +41,7 @@ Run the full Phase 2 validation smoke suite from PowerShell with `scripts/valida
 |---|---|
 | `project3-6k-core` | Platform-neutral frame timing and camera math (`glam`). |
 | `project3-6k-platform` | `winit` event loop, window lifecycle, keyboard/mouse input, and camera controls. |
-| `project3-6k-vulkan` | Explicit Vulkan instance, surface, device, swapchain, color/depth attachments, synchronization, validation monitoring, per-frame camera uniforms, and indexed forest rendering. |
+| `project3-6k-vulkan` | Explicit Vulkan instance, surface, device, swapchain, color/depth attachments, synchronization, validation monitoring, per-frame camera uniforms, sampled textures, and indexed forest rendering. |
 | `project3-6k-app` | Executable entry point and logging setup. |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) and the [architecture docs](docs/architecture/overview.md) for ownership and extension decisions.

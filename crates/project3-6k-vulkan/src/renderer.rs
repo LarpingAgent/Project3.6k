@@ -15,6 +15,8 @@ pub use validation::{ValidationMonitor, ValidationReport};
 mod depth_buffer;
 #[path = "forest_scene.rs"]
 mod forest_scene;
+#[path = "texture.rs"]
+mod texture;
 
 use depth_buffer::{DepthAttachment, choose_depth_format};
 use forest_scene::ForestScene;
@@ -43,6 +45,12 @@ pub enum VulkanRendererError {
     UnsupportedSurfaceUsage,
     #[error("the selected Vulkan device has no supported depth attachment format")]
     NoSupportedDepthFormat,
+    #[error("the selected Vulkan device has no linearly-filterable sRGB texture format")]
+    NoSupportedTextureFormat,
+    #[error("could not decode the bundled PNG texture: {0}")]
+    TextureDecode(#[source] png::DecodingError),
+    #[error("the bundled texture is invalid: {0}")]
+    InvalidTexture(&'static str),
     #[error("Vulkan validation was requested but {0} is unavailable")]
     ValidationUnavailable(&'static str),
     #[error("the embedded GLSL shader could not be decoded: {0}")]
@@ -462,6 +470,8 @@ impl SwapchainState {
                 .instance
                 .get_physical_device_memory_properties(context.physical_device)
         };
+        let texture_format =
+            texture::choose_texture_format(&context.instance, context.physical_device)?;
         for _ in &self.images {
             self.depth_images.push(DepthAttachment::new(
                 &self.device,
@@ -476,6 +486,7 @@ impl SwapchainState {
             self.render_pass,
             context.graphics_queue,
             context.queue_family_index,
+            texture_format,
         )?);
         for image in &self.images {
             let view_info = vk::ImageViewCreateInfo::default()

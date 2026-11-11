@@ -2,6 +2,7 @@ use std::{io::Cursor, mem::size_of, ptr};
 
 use ash::vk;
 
+use super::texture::{DecodedTexture, FOREST_TEXTURE_PNG, decode_png, generate_mip_chain};
 use super::{Result, VulkanRendererError};
 
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.vert.spv"));
@@ -20,6 +21,7 @@ struct ForestVertex {
 struct ForestGpuVertex {
     position: [f32; 3],
     color: [f32; 3],
+    uv: [f32; 2],
 }
 
 const VERTICES: [ForestVertex; 31] = [
@@ -170,6 +172,7 @@ pub(super) struct ForestScene {
     descriptor_sets: Vec<vk::DescriptorSet>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    texture: Option<TextureResource>,
     camera_buffers: Vec<BufferAllocation>,
     vertex_buffer: Option<BufferAllocation>,
     index_buffer: Option<BufferAllocation>,
@@ -182,6 +185,7 @@ impl ForestScene {
         render_pass: vk::RenderPass,
         graphics_queue: vk::Queue,
         queue_family_index: u32,
+        texture_format: vk::Format,
     ) -> Result<Self> {
         let mut scene = Self {
             device: device.clone(),
@@ -190,6 +194,7 @@ impl ForestScene {
             descriptor_sets: Vec::new(),
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
+            texture: None,
             camera_buffers: Vec::new(),
             vertex_buffer: None,
             index_buffer: None,
@@ -197,11 +202,18 @@ impl ForestScene {
 
         let vertex_shader = ShaderModule::new(device, VERTEX_SHADER)?;
         let fragment_shader = ShaderModule::new(device, FRAGMENT_SHADER)?;
-        let descriptor_bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX)];
+        let descriptor_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
         let descriptor_layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_bindings);
         // SAFETY: The layout has one vertex-stage uniform binding with one descriptor.
@@ -240,6 +252,12 @@ impl ForestScene {
                 binding: 0,
                 format: vk::Format::R32G32B32_SFLOAT,
                 offset: size_of::<[f32; 3]>() as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: (size_of::<[f32; 3]>() * 2) as u32,
             },
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
@@ -301,6 +319,15 @@ impl ForestScene {
             }
         };
 
+        scene.texture = Some(TextureResource::new(
+            device,
+            memory_properties,
+            graphics_queue,
+            queue_family_index,
+            texture_format,
+            decode_png(FOREST_TEXTURE_PNG)?,
+        )?);
+
         for _ in 0..super::FRAMES_IN_FLIGHT {
             scene.camera_buffers.push(BufferAllocation::new(
                 device,
@@ -312,10 +339,16 @@ impl ForestScene {
                 "host-visible camera uniform",
             )?);
         }
-        let pool_sizes = [vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::UNIFORM_BUFFER,
-            descriptor_count: super::FRAMES_IN_FLIGHT as u32,
-        }];
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: super::FRAMES_IN_FLIGHT as u32,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: super::FRAMES_IN_FLIGHT as u32,
+            },
+        ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(super::FRAMES_IN_FLIGHT as u32)
             .pool_sizes(&pool_sizes);
@@ -327,17 +360,32 @@ impl ForestScene {
             .set_layouts(&set_layouts);
         // SAFETY: The pool and every requested descriptor layout are live and compatible.
         scene.descriptor_sets = unsafe { device.allocate_descriptor_sets(&allocate_info)? };
+        let texture = scene
+            .texture
+            .as_ref()
+            .expect("texture initialized before descriptors");
         for (buffer, descriptor_set) in scene.camera_buffers.iter().zip(&scene.descriptor_sets) {
             let buffer_info = [vk::DescriptorBufferInfo::default()
                 .buffer(buffer.buffer)
                 .offset(0)
                 .range(size_of::<[[f32; 4]; 4]>() as u64)];
-            let writes = [vk::WriteDescriptorSet::default()
-                .dst_set(*descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(&buffer_info)];
-            // SAFETY: Each set references a live uniform buffer whose range fits the allocation.
+            let image_info = [vk::DescriptorImageInfo::default()
+                .sampler(texture.sampler)
+                .image_view(texture.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*descriptor_set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&buffer_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&image_info),
+            ];
+            // SAFETY: Each set references live uniform/image resources with compatible layouts.
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
 
@@ -351,6 +399,10 @@ impl ForestScene {
                     mesh_vertex_depth(index),
                 ],
                 color: vertex.color,
+                uv: [
+                    (vertex.position[0] + 1.0) * 4.0,
+                    (1.0 - vertex.position[1]) * 4.0,
+                ],
             })
             .collect::<Vec<_>>();
         let vertex_data = gpu_vertex_bytes(&gpu_vertices);
@@ -778,7 +830,7 @@ impl Drop for BufferAllocation {
 }
 
 fn gpu_vertex_bytes(values: &[ForestGpuVertex]) -> &[u8] {
-    // SAFETY: `ForestGpuVertex` is repr(C) and consists of six initialized f32 values, so it
+    // SAFETY: `ForestGpuVertex` is repr(C) and consists of eight initialized f32 values, so it
     // has no padding bytes. The returned slice is bounded by the source allocation.
     unsafe {
         std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
@@ -805,6 +857,258 @@ fn index_bytes(values: &[u16]) -> &[u8] {
     // SAFETY: Every u16 is initialized and has no padding; the output covers the same allocation.
     unsafe {
         std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+struct TextureResource {
+    device: ash::Device,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+    mip_levels: u32,
+}
+
+impl TextureResource {
+    fn new(
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        queue: vk::Queue,
+        queue_family_index: u32,
+        format: vk::Format,
+        decoded: DecodedTexture,
+    ) -> Result<Self> {
+        let mip_chain = generate_mip_chain(&decoded);
+        let mip_levels = mip_chain.len() as u32;
+        let mut staging_data = Vec::new();
+        let mut copy_regions = Vec::with_capacity(mip_chain.len());
+        for (mip_level, level) in mip_chain.iter().enumerate() {
+            let buffer_offset = staging_data.len() as u64;
+            staging_data.extend_from_slice(&level.rgba8);
+            copy_regions.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(buffer_offset)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: mip_level as u32,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(vk::Extent3D {
+                        width: level.width,
+                        height: level.height,
+                        depth: 1,
+                    }),
+            );
+        }
+
+        let staging = BufferAllocation::new(
+            device,
+            memory_properties,
+            staging_data.len(),
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE,
+            vk::MemoryPropertyFlags::HOST_COHERENT,
+            "host-visible texture staging",
+        )?;
+        staging.upload(&staging_data)?;
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: decoded.width,
+                height: decoded.height,
+                depth: 1,
+            })
+            .mip_levels(mip_levels)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // SAFETY: The decoded dimensions are nonzero and the chosen format supports sampling.
+        let image = unsafe { device.create_image(&image_info, None)? };
+        let mut texture = Self {
+            device: device.clone(),
+            image,
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            sampler: vk::Sampler::null(),
+            mip_levels,
+        };
+        // SAFETY: The image is live and owned by this texture.
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let (memory_type_index, _) = select_memory_type(
+            memory_properties,
+            &requirements,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            "device-local sampled texture",
+        )?;
+        let allocation_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type_index);
+        // SAFETY: The selected memory type meets the image's size and type-bit requirements.
+        texture.memory = unsafe { device.allocate_memory(&allocation_info, None)? };
+        // SAFETY: Image and memory belong to the same device and the allocation meets requirements.
+        unsafe { device.bind_image_memory(image, texture.memory, 0)? };
+        texture.upload_mips(queue, queue_family_index, &staging, &copy_regions)?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: mip_levels,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        // SAFETY: The view covers every color mip level of this live image.
+        texture.view = unsafe { device.create_image_view(&view_info, None)? };
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .min_lod(0.0)
+            .max_lod(mip_levels.saturating_sub(1) as f32)
+            .border_color(vk::BorderColor::INT_OPAQUE_BLACK);
+        // SAFETY: The sampler uses supported linear filtering and valid mip bounds.
+        texture.sampler = unsafe { device.create_sampler(&sampler_info, None)? };
+        Ok(texture)
+    }
+
+    fn upload_mips(
+        &self,
+        queue: vk::Queue,
+        queue_family_index: u32,
+        staging: &BufferAllocation,
+        copy_regions: &[vk::BufferImageCopy],
+    ) -> Result<()> {
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+            .queue_family_index(queue_family_index);
+        // SAFETY: This queue family supports graphics and transfer commands.
+        let command_pool = unsafe { self.device.create_command_pool(&pool_info, None)? };
+        let result = (|| {
+            let allocate_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            // SAFETY: The transient command pool is live and owns this primary command buffer.
+            let command_buffers = unsafe { self.device.allocate_command_buffers(&allocate_info)? };
+            let command_buffer = command_buffers[0];
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // SAFETY: The command buffer is allocated from the live transient pool.
+            unsafe {
+                self.device
+                    .begin_command_buffer(command_buffer, &begin_info)?
+            };
+
+            let range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: self.mip_levels,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            let to_transfer = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.image)
+                .subresource_range(range)];
+            // SAFETY: The image is exclusively owned here and every mip starts undefined.
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_transfer,
+                );
+                self.device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    staging.buffer,
+                    self.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    copy_regions,
+                );
+            }
+            let to_sample = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.image)
+                .subresource_range(range)];
+            // SAFETY: All mip levels were written by the preceding copy and are now read-only.
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_sample,
+                );
+                self.device.end_command_buffer(command_buffer)?;
+            }
+            let command_buffers = [command_buffer];
+            let submissions = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            // SAFETY: Staging and image remain alive until the queue has completed this submission.
+            unsafe {
+                self.device
+                    .queue_submit(queue, &submissions, vk::Fence::null())?;
+                self.device.queue_wait_idle(queue)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            // SAFETY: Ensure no command from the temporary pool is still executing before teardown.
+            let _ = unsafe { self.device.device_wait_idle() };
+        }
+        // SAFETY: The queue is idle on success and was idled above on error.
+        unsafe { self.device.destroy_command_pool(command_pool, None) };
+        result
+    }
+}
+
+impl Drop for TextureResource {
+    fn drop(&mut self) {
+        // SAFETY: The owning swapchain idles the device before this resource is released.
+        unsafe {
+            if self.sampler != vk::Sampler::null() {
+                self.device.destroy_sampler(self.sampler, None);
+            }
+            if self.view != vk::ImageView::null() {
+                self.device.destroy_image_view(self.view, None);
+            }
+            if self.image != vk::Image::null() {
+                self.device.destroy_image(self.image, None);
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.memory, None);
+            }
+        }
     }
 }
 
