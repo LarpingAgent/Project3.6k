@@ -14,7 +14,7 @@ flowchart TD
     Platform --> Window[Native window]
     Vulkan --> Surface[Window surface]
     Vulkan --> GPU[Graphics and presentation queue]
-    GPU --> Swapchain[Acquire → render pass → submit → present]
+    GPU --> Swapchain[Acquire → clear + indexed forest draw → submit → present]
 ```
 
 ## Crate responsibilities and dependencies
@@ -31,7 +31,7 @@ The dependency graph is one-way: app → platform → core and Vulkan. There are
 1. The platform event loop receives window and keyboard events.
 2. `about_to_wait` requests a redraw and waits until the next target frame interval.
 3. The Vulkan renderer waits for the current frame fence and acquires a swapchain image.
-4. It records the current render pass for that image, submits work waiting on image acquisition, then presents after the image-specific render semaphore signals.
+4. It clears the acquired image and records indexed forest geometry with the GLSL graphics pipeline, submits work waiting on image acquisition, then presents after the image-specific render semaphore signals.
 5. Resize and out-of-date events wait for device idle and rebuild swapchain-owned resources.
 6. `--run-frames N` exits after N successful queue submissions; `--auto-close` exits after Vulkan initialization. `--resize-stress` exercises size changes and minimized-window suspension. All use the same event-loop and RAII shutdown path as a window close.
 
@@ -47,4 +47,4 @@ Gameplay state should remain separate from rendering and native input. Future ne
 
 ## Current limits
 
-The Phase 2 renderer submits a clear-only frame and has no depth buffer, texture path, scene graph, or profiling overlay. The selected Vulkan API level is 1.0; optional modern rendering features can be evaluated when their requirements are concrete.
+The current renderer draws a static vertex-colored forest composition in clip space. It has no perspective camera, depth buffer, texture path, lighting, scene graph, or profiling overlay. The selected Vulkan API level is 1.0; optional modern rendering features can be evaluated when their requirements are concrete.

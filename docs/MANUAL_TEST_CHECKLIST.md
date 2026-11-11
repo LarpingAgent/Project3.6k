@@ -8,7 +8,7 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 - **NOT VERIFIED BY AUTOMATION** — Close the window with its title-bar close button and confirm the same shutdown path completes.
 - **NOT VERIFIED BY AUTOMATION** — Resize the window repeatedly by dragging its edge and confirm it redraws at the new size without visible corruption.
 - **NOT VERIFIED BY AUTOMATION** — Minimize and restore the window; confirm drawing suspends while minimized and resumes after restore.
-- **NOT VERIFIED BY AUTOMATION** — Confirm the background clear color is visible and the window remains responsive during a long run.
+- **NOT VERIFIED BY AUTOMATION** — Confirm the low-poly forest geometry appears over the forest-colored background and the window remains responsive during a long run.
 
 ## Future renderer milestones
 

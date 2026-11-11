@@ -11,6 +11,10 @@ mod validation;
 
 use validation::ValidationState;
 pub use validation::{ValidationMonitor, ValidationReport};
+#[path = "forest_scene.rs"]
+mod forest_scene;
+
+use forest_scene::ForestScene;
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 const DEBUG_UTILS_EXTENSION: &CStr = c"VK_EXT_debug_utils";
@@ -36,6 +40,10 @@ pub enum VulkanRendererError {
     UnsupportedSurfaceUsage,
     #[error("Vulkan validation was requested but {0} is unavailable")]
     ValidationUnavailable(&'static str),
+    #[error("the embedded GLSL shader could not be decoded: {0}")]
+    InvalidShader(#[source] std::io::Error),
+    #[error("the selected Vulkan device has no compatible host-visible memory for scene data")]
+    NoHostVisibleMemory,
 }
 
 type Result<T> = std::result::Result<T, VulkanRendererError>;
@@ -319,7 +327,7 @@ impl Drop for VulkanContext {
     }
 }
 
-/// Owns swapchain images and submits a clear-only frame.
+/// Owns swapchain images, the static forest scene, and frame submission resources.
 struct SwapchainState {
     loader: ash::khr::swapchain::Device,
     device: ash::Device,
@@ -329,6 +337,7 @@ struct SwapchainState {
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
+    forest_scene: Option<ForestScene>,
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
@@ -358,6 +367,7 @@ impl SwapchainState {
             images: Vec::new(),
             image_views: Vec::new(),
             render_pass: vk::RenderPass::null(),
+            forest_scene: None,
             framebuffers: Vec::new(),
             command_pool: vk::CommandPool::null(),
             command_buffers: Vec::new(),
@@ -431,6 +441,17 @@ impl SwapchainState {
         self.images = unsafe { self.loader.get_swapchain_images(self.swapchain)? };
 
         self.render_pass = create_render_pass(&self.device, self.format)?;
+        // SAFETY: The physical device belongs to the live Vulkan instance.
+        let memory_properties = unsafe {
+            context
+                .instance
+                .get_physical_device_memory_properties(context.physical_device)
+        };
+        self.forest_scene = Some(ForestScene::new(
+            &self.device,
+            &memory_properties,
+            self.render_pass,
+        )?);
         for image in &self.images {
             let view_info = vk::ImageViewCreateInfo::default()
                 .image(*image)
@@ -548,12 +569,15 @@ impl SwapchainState {
         let render_finished = self.render_finished[image_index];
 
         let command_buffer = self.command_buffers[image_index];
-        record_clear_pass(
+        record_scene_pass(
             &self.device,
             command_buffer,
             self.render_pass,
             self.framebuffers[image_index],
             self.extent,
+            self.forest_scene
+                .as_ref()
+                .expect("forest scene is initialized with the render pass"),
         )?;
 
         // SAFETY: Reset only after the current frame's previous work has completed.
@@ -636,6 +660,7 @@ impl SwapchainState {
             for framebuffer in self.framebuffers.drain(..).rev() {
                 self.device.destroy_framebuffer(framebuffer, None);
             }
+            self.forest_scene.take();
             for image_view in self.image_views.drain(..).rev() {
                 self.device.destroy_image_view(image_view, None);
             }
@@ -665,7 +690,7 @@ impl Drop for SwapchainState {
     }
 }
 
-/// Initializes Vulkan and renders a forest-toned clear frame to a native window.
+/// Initializes Vulkan and renders a vertex-colored forest scene to a native window.
 ///
 /// The renderer owns its instance, surface, device, swapchain, framebuffers, command buffers,
 /// synchronization primitives, and presentation state. The platform must outlive it.
@@ -711,7 +736,7 @@ impl VulkanRenderer {
         }
     }
 
-    /// Acquires, clears, submits, and presents one frame.
+    /// Acquires, records the forest scene, submits, and presents one frame.
     pub fn draw(&mut self, window: &Window) -> Result<bool> {
         if self.suspended {
             let size = window.inner_size();
@@ -821,12 +846,13 @@ fn create_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::Re
     Ok(unsafe { device.create_render_pass(&info, None)? })
 }
 
-fn record_clear_pass(
+fn record_scene_pass(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
     extent: vk::Extent2D,
+    scene: &ForestScene,
 ) -> Result<()> {
     // SAFETY: This command buffer is owned by the graphics command pool and is not in flight.
     unsafe {
@@ -852,6 +878,7 @@ fn record_clear_pass(
             &render_pass_info,
             vk::SubpassContents::INLINE,
         );
+        scene.record_draw(command_buffer, extent);
         device.cmd_end_render_pass(command_buffer);
         device.end_command_buffer(command_buffer)?;
     }

@@ -7,11 +7,11 @@ Project3.6k is a custom Rust engine foundation for a future first-person forest 
 - Cargo workspace with focused `core`, `platform`, `vulkan`, and `app` crates.
 - Native `winit` window and application lifecycle, paced at approximately 60 redraw requests per second.
 - Physical keyboard state and Escape-to-close input handling.
-- Vulkan instance and device selection, native surface, swapchain, render pass, command buffers, fences, semaphores, and swapchain recreation.
+- Vulkan instance and device selection, native surface, swapchain, render pass, GLSL graphics pipeline, vertex/index buffers, command buffers, fences, semaphores, and swapchain recreation.
 - Debug builds require `VK_LAYER_KHRONOS_validation`; the callback counts and logs warnings/errors and makes the process fail if any occur.
 - Monotonic frame timing and structured `tracing` logs.
 
-This is the application and Vulkan submission foundation. It does not yet render geometry, compile shaders, move a camera, or implement gameplay.
+The renderer currently shows a static vertex-colored forest composition using indexed triangles. The scene is still in clip space: it has no first-person camera, perspective projection, depth buffer, textures, lighting, or gameplay yet.
 
 ## Requirements
 
@@ -19,6 +19,7 @@ This is the application and Vulkan submission foundation. It does not yet render
 - Visual Studio 2022 or Build Tools with the **Desktop development with C++** workload, including the MSVC linker and Windows SDK.
 - A Vulkan-capable graphics driver.
 - The Vulkan SDK with `VK_LAYER_KHRONOS_validation` for debug builds and automated validation runs. Release builds can run without it unless `--validation` is passed.
+- The Vulkan SDK `glslc` compiler is used by the Vulkan crate build script to compile GLSL into ignored `OUT_DIR` SPIR-V files.
 
 The renderer dynamically loads the system Vulkan loader, so this phase does not need Vulkan SDK headers or link-time Vulkan libraries.
 
@@ -40,7 +41,7 @@ Run the full Phase 2 validation smoke suite from PowerShell with `scripts/valida
 |---|---|
 | `project3-6k-core` | Platform-neutral frame timing primitives. |
 | `project3-6k-platform` | `winit` event loop, window lifecycle, and input state. |
-| `project3-6k-vulkan` | Explicit Vulkan instance, surface, device, swapchain, synchronization, and validation monitoring. |
+| `project3-6k-vulkan` | Explicit Vulkan instance, surface, device, swapchain, synchronization, validation monitoring, and indexed forest rendering. |
 | `project3-6k-app` | Executable entry point and logging setup. |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) and the [architecture docs](docs/architecture/overview.md) for ownership and extension decisions.

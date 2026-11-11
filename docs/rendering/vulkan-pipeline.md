@@ -8,6 +8,7 @@
 4. Create a Vulkan 1.0 instance and native window surface.
 5. Select a device with `VK_KHR_swapchain` and one queue family that supports graphics and presentation. Prefer discrete, then integrated GPUs.
 6. Create the logical device, swapchain, image views, color-only render pass, framebuffers, command pool, command buffers, fences, and semaphores.
+7. Compile the forest GLSL shaders with Vulkan SDK `glslc`, create the vertex-color pipeline, upload static mesh buffers, and record indexed draws.
 
 FIFO presentation is used because it is guaranteed by Vulkan and provides paced presentation. Surface formats prefer BGRA8 sRGB when available, then use the first supported format. The initial pipeline does not depend on Vulkan 1.3 dynamic rendering or other optional features.
 
@@ -35,8 +36,8 @@ Zero-sized windows suspend drawing. A nonzero resize, out-of-date acquisition, o
 
 For repeatable lifecycle checks, the app accepts `--run-frames N` (positive N; exits after N successful submissions), `--auto-close` (exits immediately after renderer initialization), and `--validation` (requires validation layers). All options go through the normal event-loop exit and shutdown code. Debug builds always enable validation. The callback counts and logs every warning/error; after renderer and window destruction the app exits nonzero if any occurred. Shutdown logs the submitted frame count.
 
-Run `scripts/validation-smoke.ps1` to execute the 1, 60, and 600 frame runs and a resize-stress run. Logs go under `target/validation-runs/`. Offscreen image readback is deferred until the renderer has geometry; the Phase 2 clear-only path has no non-clear pixels to assert.
+Run `scripts/validation-smoke.ps1` to execute the 1, 60, and 600 frame runs and a resize-stress run. Logs go under `target/validation-runs/`. The current forest mesh is static clip-space geometry; perspective projection, depth, textures, and lighting remain future work. Add offscreen image readback to the automated renderer gate now that geometry exists.
 
 ## Next rendering steps
 
-Add a shader build path, graphics pipeline, vertex/index buffers, depth attachment, camera uniforms, and textured geometry. Introduce GPU suballocation only when actual resource needs and alignment requirements are known. Shadow maps, PBR, and large-world systems remain later extensions.
+The shader build path invokes `glslc` from `VULKAN_SDK` and writes SPIR-V to Cargo's `OUT_DIR`; no compiler dependency or committed shader binaries are needed. The next rendering steps are camera uniforms, perspective projection, depth testing, textured geometry, and basic lighting. GPU suballocation and staging uploads will be evaluated as mesh/resource requirements grow. Shadow maps, PBR, and large-world systems remain later extensions.

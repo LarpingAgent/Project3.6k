@@ -11,7 +11,7 @@ Vulkan resource-lifetime mistakes can be difficult to reproduce from a short int
 - `--run-frames N` counts successful queue submissions and exits through the normal event-loop shutdown path.
 - `--resize-stress` requests multiple window sizes, minimizes and restores the window, and fails unless the event loop reports a zero extent.
 - `scripts/validation-smoke.ps1` runs 1, 60, and 600 submitted frames and the resize stress sequence, checking exit codes, validation logs, and the zero-extent event.
-- Image readback is deferred until geometry is rendered; checking non-clear pixels is not meaningful for the Phase 2 clear-only pass.
+- Phase 2's clear-only smoke gate did not include image readback. The Phase 3 renderer now has visible geometry, so offscreen/readback assertions belong in the renderer verification path before the foundation is considered complete.
 
 ## Consequences
 
