@@ -1,0 +1,13 @@
+[package]
+name = "project3-6k-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+project3-6k-core = { path = "../project3-6k-core" }
+project3-6k-vulkan = { path = "../project3-6k-vulkan" }
+thiserror.workspace = true
+tracing.workspace = true
+winit.workspace = true

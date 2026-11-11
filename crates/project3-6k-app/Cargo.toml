@@ -1,0 +1,15 @@
+[package]
+name = "project3-6k-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "project3-6k"
+path = "src/main.rs"
+
+[dependencies]
+project3-6k-platform = { path = "../project3-6k-platform" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
