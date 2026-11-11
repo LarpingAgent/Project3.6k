@@ -24,12 +24,19 @@ Push-Location $projectRoot
 try {
     foreach ($run in $runs) {
         $logPath = Join-Path $logDirectory "$($run.Name).log"
+        $stdoutPath = Join-Path $logDirectory "$($run.Name).stdout.tmp"
+        $stderrPath = Join-Path $logDirectory "$($run.Name).stderr.tmp"
         $command = 'call "{0}" -arch=x64 -host_arch=x64 && set "VULKAN_SDK={1}" && set "RUST_LOG=info" && cargo run -p project3-6k-app -- {2}' -f $vsDevCmd, $vulkanSdk, $run.Arguments
         Write-Host "Running $($run.Name)..."
-        $output = & $env:ComSpec /d /s /c $command 2>&1
-        $exitCode = $LASTEXITCODE
-        $output | Tee-Object -FilePath $logPath
-        $outputText = $output -join [Environment]::NewLine
+        $process = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d', '/s', '/c', $command) `
+            -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        $exitCode = $process.ExitCode
+        $outputText = @(
+            if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw }
+            if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw }
+        ) -join [Environment]::NewLine
+        Set-Content -LiteralPath $logPath -Value $outputText
+        Remove-Item -LiteralPath $stdoutPath, $stderrPath -ErrorAction SilentlyContinue
 
         if ($exitCode -ne 0) {
             throw "$($run.Name) exited with code $exitCode. See $logPath"

@@ -2,6 +2,10 @@
 
 use std::time::{Duration, Instant};
 
+mod camera;
+
+pub use camera::Camera;
+
 /// Monotonic timing information for one application frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameTime {

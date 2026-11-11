@@ -16,6 +16,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 ash = "0.38.0"
 ash-window = "0.13.0"
+glam = "0.34.3"
 raw-window-handle = "0.6.2"
 thiserror = "2.0.21"
 tracing = "0.1.44"

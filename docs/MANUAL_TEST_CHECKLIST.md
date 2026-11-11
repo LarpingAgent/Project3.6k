@@ -10,7 +10,14 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 - **NOT VERIFIED BY AUTOMATION** — Minimize and restore the window; confirm drawing suspends while minimized and resumes after restore.
 - **NOT VERIFIED BY AUTOMATION** — Confirm the low-poly forest geometry appears over the forest-colored background and the window remains responsive during a long run.
 
+## Phase 3c first-person camera
+
+- **NOT VERIFIED BY AUTOMATION** — Run the app and left-click the window; confirm the cursor is hidden and mouse movement turns the view smoothly without the pointer reaching screen edges.
+- **NOT VERIFIED BY AUTOMATION** — Press W/A/S/D and confirm movement follows the view's horizontal direction; press Space and either Shift key to move vertically. Confirm diagonal movement is not faster.
+- **NOT VERIFIED BY AUTOMATION** — Press Escape once and confirm the cursor is released while the window remains open; press Escape again and confirm the app closes normally.
+- **NOT VERIFIED BY AUTOMATION** — Focus another window while captured, then return; confirm held keys are cleared and the cursor is released safely.
+
 ## Future renderer milestones
 
-- Add checks for camera movement, mouse capture/release, depth ordering, texture appearance, and lighting when those features exist.
+- Add checks for depth ordering, texture appearance, and lighting when those features exist.
 - Add checks for the final forest demo's visual quality and behavior on a second Vulkan-capable GPU when one is available.

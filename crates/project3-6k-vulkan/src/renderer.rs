@@ -19,7 +19,7 @@ use forest_scene::ForestScene;
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 const DEBUG_UTILS_EXTENSION: &CStr = c"VK_EXT_debug_utils";
 const SWAPCHAIN_EXTENSION: &CStr = c"VK_KHR_swapchain";
-const FRAMES_IN_FLIGHT: usize = 2;
+pub(super) const FRAMES_IN_FLIGHT: usize = 2;
 
 /// Errors returned by Vulkan initialization and frame submission.
 #[derive(Debug, Error)]
@@ -537,12 +537,20 @@ impl SwapchainState {
         Ok(())
     }
 
-    fn draw(&mut self, context: &VulkanContext) -> Result<FrameDrawOutcome> {
+    fn draw(
+        &mut self,
+        context: &VulkanContext,
+        view_projection: [[f32; 4]; 4],
+    ) -> Result<FrameDrawOutcome> {
         let frame = &self.frames[self.current_frame];
         let image_available = frame.image_available;
         let in_flight = frame.in_flight;
         // SAFETY: This fence belongs to the current frame and was signaled on its last use.
         unsafe { self.device.wait_for_fences(&[in_flight], true, u64::MAX)? };
+        self.forest_scene
+            .as_ref()
+            .expect("forest scene is initialized with the render pass")
+            .update_camera(self.current_frame, view_projection)?;
         // SAFETY: The swapchain and semaphore are live. The timeout is intentionally unbounded;
         // acquisition will complete once a presentable image becomes available.
         let (image_index, was_suboptimal) = match unsafe {
@@ -585,6 +593,7 @@ impl SwapchainState {
             self.forest_scene
                 .as_ref()
                 .expect("forest scene is initialized with the render pass"),
+            self.current_frame,
         )?;
 
         // SAFETY: Reset only after the current frame's previous work has completed.
@@ -744,7 +753,7 @@ impl VulkanRenderer {
     }
 
     /// Acquires, records the forest scene, submits, and presents one frame.
-    pub fn draw(&mut self, window: &Window) -> Result<bool> {
+    pub fn draw(&mut self, window: &Window, view_projection: [[f32; 4]; 4]) -> Result<bool> {
         if self.suspended {
             let size = window.inner_size();
             self.suspended = size.width == 0 || size.height == 0;
@@ -759,7 +768,7 @@ impl VulkanRenderer {
                 return Ok(false);
             }
         }
-        let outcome = self.swapchain.draw(&self.context)?;
+        let outcome = self.swapchain.draw(&self.context, view_projection)?;
         if outcome.recreate_swapchain {
             self.resized = !self.swapchain.recreate(&self.context, window)?;
         }
@@ -860,6 +869,7 @@ fn record_scene_pass(
     framebuffer: vk::Framebuffer,
     extent: vk::Extent2D,
     scene: &ForestScene,
+    frame_index: usize,
 ) -> Result<()> {
     // SAFETY: This command buffer is owned by the graphics command pool and is not in flight.
     unsafe {
@@ -885,7 +895,7 @@ fn record_scene_pass(
             &render_pass_info,
             vk::SubpassContents::INLINE,
         );
-        scene.record_draw(command_buffer, extent);
+        scene.record_draw(command_buffer, extent, frame_index);
         device.cmd_end_render_pass(command_buffer);
         device.end_command_buffer(command_buffer)?;
     }

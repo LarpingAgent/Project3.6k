@@ -1,6 +1,6 @@
 # Thread model
 
-The initial application is single-threaded on the CPU. `winit` dispatches native events, the platform layer updates input and frame timing, and Vulkan command recording/submission is performed from the same event-loop thread. The GPU and presentation engine execute submitted work asynchronously, ordered by explicit semaphores and fences.
+The initial application is single-threaded on the CPU. `winit` dispatches native keyboard, raw mouse, and focus events; the platform layer updates input, camera pose, and frame timing; Vulkan command recording/submission is performed from the same event-loop thread. The GPU and presentation engine execute submitted work asynchronously, ordered by explicit semaphores and fences. A frame's uniform buffer is written only after its fence signals.
 
 The Vulkan validation callback writes through atomic counters and a mutex-protected message list. This keeps its monitor safe if a Vulkan implementation invokes the callback from a different thread; the monitor is read after renderer teardown.
 

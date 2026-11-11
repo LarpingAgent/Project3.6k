@@ -6,11 +6,19 @@ use super::{Result, VulkanRendererError};
 
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.vert.spv"));
 const FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.frag.spv"));
+const FOREST_PLANE_SCALE: [f32; 2] = [2.2581, 1.2702];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ForestVertex {
     position: [f32; 2],
+    color: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ForestGpuVertex {
+    position: [f32; 3],
     color: [f32; 3],
 }
 
@@ -153,8 +161,12 @@ const INDICES: [u16; 39] = [
 
 pub(super) struct ForestScene {
     device: ash::Device,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_sets: Vec<vk::DescriptorSet>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    camera_buffers: Vec<BufferAllocation>,
     vertex_buffer: Option<BufferAllocation>,
     index_buffer: Option<BufferAllocation>,
 }
@@ -169,16 +181,31 @@ impl ForestScene {
     ) -> Result<Self> {
         let mut scene = Self {
             device: device.clone(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            descriptor_sets: Vec::new(),
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
+            camera_buffers: Vec::new(),
             vertex_buffer: None,
             index_buffer: None,
         };
 
         let vertex_shader = ShaderModule::new(device, VERTEX_SHADER)?;
         let fragment_shader = ShaderModule::new(device, FRAGMENT_SHADER)?;
-        let layout_info = vk::PipelineLayoutCreateInfo::default();
-        // SAFETY: The pipeline layout has no descriptors or push constants and owns no borrowed data.
+        let descriptor_bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX)];
+        let descriptor_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_bindings);
+        // SAFETY: The layout has one vertex-stage uniform binding with one descriptor.
+        scene.descriptor_set_layout =
+            unsafe { device.create_descriptor_set_layout(&descriptor_layout_info, None)? };
+        let descriptor_layouts = [scene.descriptor_set_layout];
+        let layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_layouts);
+        // SAFETY: The set layout is live and remains owned by this scene for the pipeline lifetime.
         scene.pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
 
         let entry_point = c"main";
@@ -194,21 +221,21 @@ impl ForestScene {
         ];
         let bindings = [vk::VertexInputBindingDescription {
             binding: 0,
-            stride: size_of::<ForestVertex>() as u32,
+            stride: size_of::<ForestGpuVertex>() as u32,
             input_rate: vk::VertexInputRate::VERTEX,
         }];
         let attributes = [
             vk::VertexInputAttributeDescription {
                 location: 0,
                 binding: 0,
-                format: vk::Format::R32G32_SFLOAT,
+                format: vk::Format::R32G32B32_SFLOAT,
                 offset: 0,
             },
             vk::VertexInputAttributeDescription {
                 location: 1,
                 binding: 0,
                 format: vk::Format::R32G32B32_SFLOAT,
-                offset: (size_of::<[f32; 2]>()) as u32,
+                offset: size_of::<[f32; 3]>() as u32,
             },
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
@@ -263,7 +290,55 @@ impl ForestScene {
             }
         };
 
-        let vertex_data = bytemuck_bytes(&VERTICES);
+        for _ in 0..super::FRAMES_IN_FLIGHT {
+            scene.camera_buffers.push(BufferAllocation::new(
+                device,
+                memory_properties,
+                size_of::<[[f32; 4]; 4]>(),
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE,
+                vk::MemoryPropertyFlags::HOST_COHERENT,
+                "host-visible camera uniform",
+            )?);
+        }
+        let pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: super::FRAMES_IN_FLIGHT as u32,
+        }];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(super::FRAMES_IN_FLIGHT as u32)
+            .pool_sizes(&pool_sizes);
+        // SAFETY: The pool capacity covers each per-frame camera uniform descriptor.
+        scene.descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
+        let set_layouts = vec![scene.descriptor_set_layout; super::FRAMES_IN_FLIGHT];
+        let allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(scene.descriptor_pool)
+            .set_layouts(&set_layouts);
+        // SAFETY: The pool and every requested descriptor layout are live and compatible.
+        scene.descriptor_sets = unsafe { device.allocate_descriptor_sets(&allocate_info)? };
+        for (buffer, descriptor_set) in scene.camera_buffers.iter().zip(&scene.descriptor_sets) {
+            let buffer_info = [vk::DescriptorBufferInfo::default()
+                .buffer(buffer.buffer)
+                .offset(0)
+                .range(size_of::<[[f32; 4]; 4]>() as u64)];
+            let writes = [vk::WriteDescriptorSet::default()
+                .dst_set(*descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&buffer_info)];
+            // SAFETY: Each set references a live uniform buffer whose range fits the allocation.
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+        }
+
+        let gpu_vertices = VERTICES.map(|vertex| ForestGpuVertex {
+            position: [
+                vertex.position[0] * FOREST_PLANE_SCALE[0],
+                vertex.position[1] * FOREST_PLANE_SCALE[1],
+                0.0,
+            ],
+            color: vertex.color,
+        });
+        let vertex_data = gpu_vertex_bytes(&gpu_vertices);
         let index_data = index_bytes(&INDICES);
         let vertex_size = vertex_data.len();
         let index_offset = align_up_4(vertex_size);
@@ -319,7 +394,20 @@ impl ForestScene {
         Ok(scene)
     }
 
-    pub(super) fn record_draw(&self, command_buffer: vk::CommandBuffer, extent: vk::Extent2D) {
+    pub(super) fn update_camera(
+        &self,
+        frame_index: usize,
+        view_projection: [[f32; 4]; 4],
+    ) -> Result<()> {
+        self.camera_buffers[frame_index].upload(matrix_bytes(&view_projection))
+    }
+
+    pub(super) fn record_draw(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        extent: vk::Extent2D,
+        frame_index: usize,
+    ) {
         let vertex_buffer = self
             .vertex_buffer
             .as_ref()
@@ -342,6 +430,7 @@ impl ForestScene {
         }];
         let vertex_buffers = [vertex_buffer.buffer];
         let offsets = [0];
+        let descriptor_sets = [self.descriptor_sets[frame_index]];
         // SAFETY: The command buffer is recording inside the compatible render pass. The
         // pipeline, buffers, viewport, and index range are owned by this live scene.
         unsafe {
@@ -352,6 +441,14 @@ impl ForestScene {
             );
             self.device.cmd_set_viewport(command_buffer, 0, &viewports);
             self.device.cmd_set_scissor(command_buffer, 0, &scissors);
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &descriptor_sets,
+                &[],
+            );
             self.device
                 .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
             self.device.cmd_bind_index_buffer(
@@ -373,9 +470,19 @@ impl Drop for ForestScene {
             if self.pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.pipeline, None);
             }
+            if self.descriptor_pool != vk::DescriptorPool::null() {
+                self.device
+                    .destroy_descriptor_pool(self.descriptor_pool, None);
+                self.descriptor_pool = vk::DescriptorPool::null();
+            }
             if self.pipeline_layout != vk::PipelineLayout::null() {
                 self.device
                     .destroy_pipeline_layout(self.pipeline_layout, None);
+            }
+            if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
+                self.device
+                    .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+                self.descriptor_set_layout = vk::DescriptorSetLayout::null();
             }
         }
     }
@@ -653,12 +760,17 @@ impl Drop for BufferAllocation {
     }
 }
 
-fn bytemuck_bytes(values: &[ForestVertex]) -> &[u8] {
-    // SAFETY: `ForestVertex` is repr(C) and consists of five initialized f32 values, so it
+fn gpu_vertex_bytes(values: &[ForestGpuVertex]) -> &[u8] {
+    // SAFETY: `ForestGpuVertex` is repr(C) and consists of six initialized f32 values, so it
     // has no padding bytes. The returned slice is bounded by the source allocation.
     unsafe {
         std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
+}
+
+fn matrix_bytes(values: &[[f32; 4]; 4]) -> &[u8] {
+    // SAFETY: The matrix is exactly sixteen initialized f32 values with no padding between them.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
 }
 
 fn index_bytes(values: &[u16]) -> &[u8] {

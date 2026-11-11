@@ -6,6 +6,7 @@ use winit::keyboard::KeyCode;
 #[derive(Debug, Default)]
 pub struct InputState {
     keys_down: HashSet<KeyCode>,
+    mouse_delta: [f64; 2],
 }
 
 impl InputState {
@@ -19,6 +20,11 @@ impl InputState {
         self.keys_down.len()
     }
 
+    /// Returns and clears the accumulated raw mouse movement since the previous call.
+    pub fn take_mouse_delta(&mut self) -> [f64; 2] {
+        std::mem::take(&mut self.mouse_delta)
+    }
+
     pub(crate) fn set_key_down(&mut self, key: KeyCode, is_down: bool) {
         if is_down {
             self.keys_down.insert(key);
@@ -27,8 +33,16 @@ impl InputState {
         }
     }
 
+    pub(crate) fn add_mouse_motion(&mut self, delta: (f64, f64)) {
+        if delta.0.is_finite() && delta.1.is_finite() {
+            self.mouse_delta[0] += delta.0;
+            self.mouse_delta[1] += delta.1;
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         self.keys_down.clear();
+        self.mouse_delta = [0.0; 2];
     }
 }
 
@@ -51,5 +65,18 @@ mod tests {
 
         input.clear();
         assert_eq!(input.keys_down_count(), 0);
+    }
+
+    #[test]
+    fn accumulates_mouse_delta_until_read_and_clears_on_focus_loss() {
+        let mut input = InputState::default();
+        input.add_mouse_motion((2.5, -1.0));
+        input.add_mouse_motion((0.5, 3.0));
+        assert_eq!(input.take_mouse_delta(), [3.0, 2.0]);
+        assert_eq!(input.take_mouse_delta(), [0.0, 0.0]);
+
+        input.add_mouse_motion((4.0, 5.0));
+        input.clear();
+        assert_eq!(input.take_mouse_delta(), [0.0, 0.0]);
     }
 }

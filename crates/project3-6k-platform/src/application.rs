@@ -1,20 +1,22 @@
 use std::time::{Duration, Instant};
 
-use project3_6k_core::FrameClock;
+use project3_6k_core::{Camera, FrameClock};
 use project3_6k_vulkan::{VulkanRenderer, VulkanRendererError};
 use thiserror::Error;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
     error::{EventLoopError, OsError},
-    event::{ElementState, WindowEvent},
+    event::{DeviceEvent, ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowId},
+    window::{CursorGrabMode, Window, WindowId},
 };
 
 use crate::InputState;
+
+const MOUSE_SENSITIVITY: f32 = 0.0025;
 
 const TARGET_FRAME_DURATION: Duration = Duration::from_nanos(16_666_667);
 
@@ -104,6 +106,8 @@ struct EngineApplication {
     window: Option<Window>,
     renderer: Option<VulkanRenderer>,
     input: InputState,
+    camera: Camera,
+    cursor_captured: bool,
     clock: Option<FrameClock>,
     failure: Option<ApplicationError>,
     frames_rendered: u64,
@@ -138,7 +142,9 @@ impl ApplicationHandler for EngineApplication {
                 self.clock = Some(FrameClock::default());
                 self.renderer = Some(renderer);
                 self.window = Some(window);
-                info!("application foundation ready; press Escape to close");
+                info!(
+                    "application ready; click to capture mouse, WASD to move, Space/Shift to rise or descend, Escape to release or close"
+                );
                 if self.options.auto_close {
                     info!("auto-close requested after renderer initialization");
                     event_loop.exit();
@@ -178,13 +184,26 @@ impl ApplicationHandler for EngineApplication {
                     renderer.resize(size.width, size.height);
                 }
             }
-            WindowEvent::Focused(false) => self.input.clear(),
+            WindowEvent::Focused(false) => {
+                self.input.clear();
+                self.set_cursor_capture(false);
+            }
+            WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                state: ElementState::Pressed,
+                ..
+            } if !self.cursor_captured => self.set_cursor_capture(true),
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(key) = event.physical_key {
                     let is_down = event.state == ElementState::Pressed;
                     self.input.set_key_down(key, is_down);
                     if is_down && key == KeyCode::Escape {
-                        event_loop.exit();
+                        if self.cursor_captured {
+                            self.set_cursor_capture(false);
+                            info!("mouse released; press Escape again to close");
+                        } else {
+                            event_loop.exit();
+                        }
                     } else if is_down && !event.repeat {
                         debug!(?key, "keyboard input received");
                     }
@@ -192,6 +211,19 @@ impl ApplicationHandler for EngineApplication {
             }
             WindowEvent::RedrawRequested => self.render_frame(event_loop),
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        if self.cursor_captured {
+            if let DeviceEvent::MouseMotion { delta } = event {
+                self.input.add_mouse_motion(delta);
+            }
         }
     }
 
@@ -207,6 +239,37 @@ impl ApplicationHandler for EngineApplication {
 }
 
 impl EngineApplication {
+    fn set_cursor_capture(&mut self, captured: bool) {
+        let Some(window) = self.window.as_ref() else {
+            self.cursor_captured = false;
+            return;
+        };
+
+        if captured {
+            let grabbed = match window.set_cursor_grab(CursorGrabMode::Locked) {
+                Ok(()) => true,
+                Err(locked_error) => match window.set_cursor_grab(CursorGrabMode::Confined) {
+                    Ok(()) => {
+                        info!("locked cursor unavailable; using confined cursor");
+                        true
+                    }
+                    Err(confined_error) => {
+                        warn!(%locked_error, %confined_error, "could not capture cursor");
+                        false
+                    }
+                },
+            };
+            self.cursor_captured = grabbed;
+            window.set_cursor_visible(!grabbed);
+        } else {
+            if let Err(error) = window.set_cursor_grab(CursorGrabMode::None) {
+                warn!(%error, "could not release cursor grab");
+            }
+            window.set_cursor_visible(true);
+            self.cursor_captured = false;
+        }
+    }
+
     fn advance_resize_stress(&mut self) {
         if !self.options.resize_stress || self.resize_stress_stage >= 4 {
             return;
@@ -249,11 +312,39 @@ impl EngineApplication {
     }
 
     fn render_frame(&mut self, event_loop: &ActiveEventLoop) {
+        let frame_time = self.clock.as_mut().map(FrameClock::tick);
+        let delta_seconds = frame_time
+            .map(|time| time.delta.min(Duration::from_millis(100)).as_secs_f32())
+            .unwrap_or(0.0);
+        let [mouse_x, mouse_y] = self.input.take_mouse_delta();
+        if self.cursor_captured {
+            self.camera.rotate(
+                (mouse_x as f32) * MOUSE_SENSITIVITY,
+                (mouse_y as f32) * MOUSE_SENSITIVITY,
+            );
+        }
+        let forward = self.input.is_key_down(KeyCode::KeyW) as u8 as f32
+            - self.input.is_key_down(KeyCode::KeyS) as u8 as f32;
+        let right = self.input.is_key_down(KeyCode::KeyD) as u8 as f32
+            - self.input.is_key_down(KeyCode::KeyA) as u8 as f32;
+        let vertical = self.input.is_key_down(KeyCode::Space) as u8 as f32
+            - (self.input.is_key_down(KeyCode::ShiftLeft)
+                || self.input.is_key_down(KeyCode::ShiftRight)) as u8 as f32;
+        self.camera
+            .move_local(forward, right, vertical, delta_seconds);
+        let aspect_ratio = self
+            .window
+            .as_ref()
+            .map(Window::inner_size)
+            .map(|size| size.width as f32 / size.height.max(1) as f32)
+            .unwrap_or(1.0);
+        let view_projection = self.camera.view_projection(aspect_ratio).to_cols_array_2d();
+
         let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
             return;
         };
 
-        let submitted = match renderer.draw(window) {
+        let submitted = match renderer.draw(window, view_projection) {
             Ok(submitted) => submitted,
             Err(error) => {
                 error!(%error, "frame rendering failed");
@@ -274,10 +365,9 @@ impl EngineApplication {
             }
         }
 
-        let Some(clock) = self.clock.as_mut() else {
+        let Some(frame_time) = frame_time else {
             return;
         };
-        let frame_time = clock.tick();
         if frame_time.frame_index % 120 == 0 {
             debug!(
                 frame = frame_time.frame_index,
@@ -290,6 +380,9 @@ impl EngineApplication {
 
 impl Drop for EngineApplication {
     fn drop(&mut self) {
+        if self.cursor_captured {
+            self.set_cursor_capture(false);
+        }
         // The Vulkan surface must be destroyed before its native window. Take the renderer
         // first so its swapchain, surface, and instance are torn down while the window lives.
         drop(self.renderer.take());
