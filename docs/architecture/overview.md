@@ -26,4 +26,4 @@ The renderer owns the static indexed textured and lit forest draw, depth-tested 
 
 ## Planned growth
 
-When needed, general asset, scene, world, physics, and audio crates can be introduced with explicit interfaces. Core already owns the camera math; the current starter lighting uses authored normals and can move to mesh-derived normals as the forest gains spatial geometry. World streaming should use bounded budgets and asynchronous loading rather than retaining the complete world in memory.
+The assets crate provides the first concrete CPU texture path, and core provides bounded scene nodes and TRS transforms. The current forest scene is static: its local transforms are baked into the initial vertex upload. Add dynamic transform upload only when moving scene objects become part of the demo. World streaming should use bounded budgets and asynchronous loading rather than retaining the complete world in memory.

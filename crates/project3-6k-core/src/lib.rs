@@ -3,8 +3,10 @@
 use std::time::{Duration, Instant};
 
 mod camera;
+mod scene;
 
 pub use camera::Camera;
+pub use scene::{MeshHandle, Scene, SceneError, SceneNode, SceneNodeId, Transform};
 
 /// Monotonic timing information for one application frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

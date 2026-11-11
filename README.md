@@ -7,6 +7,7 @@ Project3.6k is a custom Rust engine foundation for a future first-person forest 
 - Cargo workspace with focused `assets`, `core`, `platform`, `vulkan`, and `app` crates.
 - Game texture sources live under the workspace-level `assets/` directory.
 - Renderer-independent PNG texture loading with keyed handles, mip generation, and decoded-memory limits.
+- Bounded mesh-instance scene data with scale/rotation/translation transforms, baked into the static forest mesh at initialization.
 - Native `winit` window and application lifecycle, paced at approximately 60 redraw requests per second.
 - Physical keyboard state, raw mouse input, cursor capture/release, and first-person WASD camera controls.
 - Vulkan instance and device selection, native surface, swapchain, render pass, GLSL graphics pipeline, vertex/index buffers, command buffers, fences, semaphores, and swapchain recreation.
@@ -42,7 +43,7 @@ Run the full Phase 2 validation smoke suite from PowerShell with `scripts/valida
 | Crate | Responsibility |
 |---|---|
 | `project3-6k-assets` | Bounded CPU-side PNG loading, keyed texture handles, mip generation, and cache lifetime management. |
-| `project3-6k-core` | Platform-neutral frame timing, camera math, scene nodes, and transforms (`glam`). |
+| `project3-6k-core` | Platform-neutral frame timing, camera math, bounded scene nodes, and transforms (`glam`). |
 | `project3-6k-platform` | `winit` event loop, window lifecycle, keyboard/mouse input, and camera controls. |
 | `project3-6k-vulkan` | Explicit Vulkan instance, surface, device, swapchain, color/depth attachments, synchronization, validation monitoring, per-frame camera uniforms, sampled textures, ambient/directional lighting, and indexed forest rendering. |
 | `project3-6k-app` | Executable entry point and logging setup. |

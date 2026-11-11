@@ -14,6 +14,8 @@ The scene embeds the workspace asset `assets/forest_noise.png` at build time and
 
 The vertex stream carries a low-poly normal for each forest surface. The fragment shader combines the sampled, vertex-tinted albedo with a fixed world-space directional light and a 0.26 ambient floor using Lambert diffuse. Lighting values are constants in the shader, so no extra uniform or per-frame update is needed. The authored normals give the current planar canopy facets directional variation; a future spatial mesh can replace them with mesh-derived normals.
 
+Core's bounded `Scene` represents the ground, three trees, and distant ridge as mesh-handle nodes with local TRS transforms. The renderer applies each node's matrix to its local vertex positions and the inverse-transpose normal matrix to its normals before the device-local upload. Node insertion order maps to indexed draw ranges, keeping the ridge last while allowing depth testing to determine visibility. This first scene is static; changing a `Scene` transform after upload does not update the GPU mesh yet.
+
 FIFO presentation is used because it is guaranteed by Vulkan and provides paced presentation. Surface formats prefer BGRA8 sRGB when available, then use the first supported format. The initial pipeline does not depend on Vulkan 1.3 dynamic rendering or other optional features.
 
 ## Frame submission

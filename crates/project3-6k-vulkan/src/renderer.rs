@@ -47,6 +47,8 @@ pub enum VulkanRendererError {
     NoSupportedTextureFormat,
     #[error("could not load a renderer texture asset: {0}")]
     Asset(#[from] project3_6k_assets::AssetError),
+    #[error("could not build the scene: {0}")]
+    Scene(#[from] project3_6k_core::SceneError),
     #[error("the renderer could not resolve a texture immediately after loading it")]
     MissingTextureAsset,
     #[error("Vulkan validation was requested but {0} is unavailable")]

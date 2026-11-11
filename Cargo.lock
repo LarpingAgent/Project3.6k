@@ -971,6 +971,7 @@ name = "project3-6k-core"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -990,7 +991,9 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
+ "glam",
  "project3-6k-assets",
+ "project3-6k-core",
  "raw-window-handle",
  "thiserror 2.0.21",
  "tracing",

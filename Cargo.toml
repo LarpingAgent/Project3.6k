@@ -19,6 +19,7 @@ ash = "0.38.0"
 ash-window = "0.13.0"
 glam = "0.34.3"
 png = "0.18.1"
+project3-6k-core = { path = "crates/project3-6k-core" }
 project3-6k-assets = { path = "crates/project3-6k-assets" }
 raw-window-handle = "0.6.2"
 thiserror = "2.0.21"

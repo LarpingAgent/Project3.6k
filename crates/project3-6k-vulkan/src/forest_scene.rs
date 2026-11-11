@@ -3,12 +3,16 @@ use std::{io::Cursor, mem::size_of, ptr};
 use ash::vk;
 
 use super::{Result, VulkanRendererError};
+use glam::{Quat, Vec3};
 use project3_6k_assets::{AssetManager, TextureAsset};
+use project3_6k_core::{MeshHandle, Scene, SceneNode, Transform};
 
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.vert.spv"));
 const FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.frag.spv"));
 const FOREST_TEXTURE_PNG: &[u8] = include_bytes!("../../../assets/forest_noise.png");
 const FOREST_PLANE_SCALE: [f32; 2] = [2.2581, 1.2702];
+const FOREST_NODE_TRANSFORMS: [(u32, f32); 5] =
+    [(0, 0.0), (1, 0.1), (2, 0.25), (3, 0.1), (4, -0.45)];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -169,6 +173,7 @@ const MESH_DRAW_RANGES: [(u32, u32); 5] = [(0, 6), (12, 9), (21, 9), (30, 9), (6
 
 pub(super) struct ForestScene {
     device: ash::Device,
+    scene: Scene,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
@@ -189,8 +194,10 @@ impl ForestScene {
         queue_family_index: u32,
         texture_format: vk::Format,
     ) -> Result<Self> {
+        let render_scene = create_forest_scene()?;
         let mut scene = Self {
             device: device.clone(),
+            scene: render_scene,
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_sets: Vec::new(),
@@ -406,17 +413,19 @@ impl ForestScene {
             .iter()
             .enumerate()
             .map(|(index, vertex)| ForestGpuVertex {
-                position: [
-                    vertex.position[0] * FOREST_PLANE_SCALE[0],
-                    vertex.position[1] * FOREST_PLANE_SCALE[1],
-                    mesh_vertex_depth(index),
-                ],
+                position: scene_node_for_vertex(&scene.scene, index)
+                    .transform()
+                    .transform_point(Vec3::new(vertex.position[0], vertex.position[1], 0.0))
+                    .to_array(),
                 color: vertex.color,
                 uv: [
                     (vertex.position[0] + 1.0) * 4.0,
                     (1.0 - vertex.position[1]) * 4.0,
                 ],
-                normal: forest_vertex_normal(index),
+                normal: scene_node_for_vertex(&scene.scene, index)
+                    .transform()
+                    .transform_normal(Vec3::from_array(forest_vertex_normal(index)))
+                    .to_array(),
             })
             .collect::<Vec<_>>();
         let vertex_data = gpu_vertex_bytes(&gpu_vertices);
@@ -538,7 +547,8 @@ impl ForestScene {
                 0,
                 vk::IndexType::UINT16,
             );
-            for (first_index, index_count) in MESH_DRAW_RANGES {
+            for node in self.scene.nodes() {
+                let (first_index, index_count) = MESH_DRAW_RANGES[node.mesh().index() as usize];
                 self.device
                     .cmd_draw_indexed(command_buffer, index_count, 1, first_index, 0, 0);
             }
@@ -851,17 +861,6 @@ fn gpu_vertex_bytes(values: &[ForestGpuVertex]) -> &[u8] {
     }
 }
 
-fn mesh_vertex_depth(index: usize) -> f32 {
-    match index {
-        0..=3 => 0.0,
-        4..=9 => -0.45,
-        10..=16 => 0.1,
-        17..=23 => 0.25,
-        24..=30 => 0.1,
-        _ => unreachable!("mesh vertex index validated by the static vertex table"),
-    }
-}
-
 fn forest_vertex_normal(index: usize) -> [f32; 3] {
     match index {
         0..=3 => [0.0, 0.2, 0.98],
@@ -874,6 +873,38 @@ fn forest_vertex_normal(index: usize) -> [f32; 3] {
         27..=30 => [0.0, 0.0, 1.0],
         _ => unreachable!("mesh vertex index validated by the static vertex table"),
     }
+}
+
+fn create_forest_scene() -> Result<Scene> {
+    let mut scene = Scene::new(FOREST_NODE_TRANSFORMS.len());
+    let scale = Vec3::new(FOREST_PLANE_SCALE[0], FOREST_PLANE_SCALE[1], 1.0);
+    for (mesh_index, depth) in FOREST_NODE_TRANSFORMS {
+        let transform = Transform::from_trs(Vec3::new(0.0, 0.0, depth), Quat::IDENTITY, scale)
+            .expect("the fixed forest transforms are finite and non-singular");
+        scene.add_node(MeshHandle::new(mesh_index), transform)?;
+    }
+    Ok(scene)
+}
+
+fn mesh_handle_for_vertex(index: usize) -> MeshHandle {
+    let mesh_index = match index {
+        0..=3 => 0,
+        4..=9 => 4,
+        10..=16 => 1,
+        17..=23 => 2,
+        24..=30 => 3,
+        _ => unreachable!("mesh vertex index validated by the static vertex table"),
+    };
+    MeshHandle::new(mesh_index)
+}
+
+fn scene_node_for_vertex(scene: &Scene, vertex_index: usize) -> SceneNode {
+    let mesh = mesh_handle_for_vertex(vertex_index);
+    *scene
+        .nodes()
+        .iter()
+        .find(|node| node.mesh() == mesh)
+        .expect("every forest vertex belongs to one scene mesh")
 }
 
 fn matrix_bytes(values: &[[f32; 4]; 4]) -> &[u8] {
@@ -1142,8 +1173,9 @@ impl Drop for TextureResource {
 #[cfg(test)]
 mod tests {
     use super::{
-        INDICES, MESH_DRAW_RANGES, VERTICES, VulkanRendererError, align_up_4, forest_vertex_normal,
-        mesh_vertex_depth, select_memory_type,
+        FOREST_NODE_TRANSFORMS, INDICES, MESH_DRAW_RANGES, VERTICES, VulkanRendererError,
+        align_up_4, create_forest_scene, forest_vertex_normal, mesh_handle_for_vertex,
+        scene_node_for_vertex, select_memory_type,
     };
     use ash::vk;
 
@@ -1174,8 +1206,32 @@ mod tests {
 
     #[test]
     fn far_ridge_is_drawn_after_nearer_tree_meshes() {
-        assert_eq!(MESH_DRAW_RANGES.last(), Some(&(6, 6)));
-        assert!(mesh_vertex_depth(4) < mesh_vertex_depth(17));
+        let scene = create_forest_scene().unwrap();
+        let ridge = scene.nodes().last().unwrap();
+        let center_tree = scene
+            .nodes()
+            .iter()
+            .find(|node| node.mesh().index() == 2)
+            .unwrap();
+
+        assert_eq!(ridge.mesh().index(), 4);
+        assert!(ridge.transform().translation().z < center_tree.transform().translation().z);
+    }
+
+    #[test]
+    fn forest_scene_transforms_bound_mesh_instances_and_mesh_vertices() {
+        let scene = create_forest_scene().unwrap();
+        assert_eq!(scene.nodes().len(), FOREST_NODE_TRANSFORMS.len());
+        assert_eq!(scene.max_nodes(), FOREST_NODE_TRANSFORMS.len());
+        assert_eq!(mesh_handle_for_vertex(4).index(), 4);
+        assert_eq!(mesh_handle_for_vertex(12).index(), 1);
+
+        let ground = scene_node_for_vertex(&scene, 0);
+        let world_point = ground
+            .transform()
+            .transform_point(glam::Vec3::new(-1.0, -0.56, 0.0));
+        assert!((world_point.x + 2.2581).abs() < 0.0001);
+        assert!((world_point.y + 0.711312).abs() < 0.0001);
     }
 
     #[test]
