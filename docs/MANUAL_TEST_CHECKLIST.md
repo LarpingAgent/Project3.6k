@@ -31,6 +31,11 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 - **NOT VERIFIED BY AUTOMATION** — Confirm canopy facets show the expected light-to-dark variation, trunks and ground remain visible under the ambient floor, and lighting stays fixed in world space while the camera turns.
 - **NOT VERIFIED BY AUTOMATION** — Move around the scene and resize the window; confirm normals do not produce abrupt shading seams or black faces.
 
+## Phase 4 profiling and debug display
+
+- **NOT VERIFIED BY AUTOMATION** — Run for at least 120 frames and confirm the title bar refreshes with FPS, average/p95 frame interval, renderer-call CPU time, and current camera position.
+- **NOT VERIFIED BY AUTOMATION** — Move the camera and confirm the position values update; compare the displayed FPS and timing values with a longer run to make sure the rolling window recovers after a brief hitch.
+
 ## Future manual checks
 
 - Add checks for the final forest demo's visual quality and behavior on a second Vulkan-capable GPU when one is available.

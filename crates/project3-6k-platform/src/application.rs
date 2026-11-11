@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use project3_6k_core::{Camera, FrameClock};
+use project3_6k_core::{Camera, FrameClock, FrameProfiler};
 use project3_6k_vulkan::{VulkanRenderer, VulkanRendererError};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -109,6 +109,7 @@ struct EngineApplication {
     camera: Camera,
     cursor_captured: bool,
     clock: Option<FrameClock>,
+    profiler: FrameProfiler,
     failure: Option<ApplicationError>,
     frames_rendered: u64,
     resize_events: u64,
@@ -344,7 +345,10 @@ impl EngineApplication {
             return;
         };
 
-        let submitted = match renderer.draw(window, view_projection) {
+        let renderer_started = Instant::now();
+        let draw_result = renderer.draw(window, view_projection);
+        let renderer_cpu = renderer_started.elapsed();
+        let submitted = match draw_result {
             Ok(submitted) => submitted,
             Err(error) => {
                 error!(%error, "frame rendering failed");
@@ -365,15 +369,31 @@ impl EngineApplication {
             }
         }
 
-        let Some(frame_time) = frame_time else {
-            return;
-        };
-        if frame_time.frame_index % 120 == 0 {
+        if let Some(stats) =
+            frame_time.and_then(|frame_time| self.profiler.record(frame_time.delta, renderer_cpu))
+        {
             debug!(
-                frame = frame_time.frame_index,
-                delta_ms = frame_time.delta.as_secs_f64() * 1000.0,
-                "frame timing"
+                samples = stats.sample_count,
+                fps = stats.frames_per_second,
+                average_frame_ms = stats.average_frame_ms,
+                p95_frame_ms = stats.p95_frame_ms,
+                maximum_frame_ms = stats.maximum_frame_ms,
+                average_renderer_cpu_ms = stats.average_renderer_cpu_ms,
+                "rolling frame profile"
             );
+            if let Some(window) = self.window.as_ref() {
+                let position = self.camera.position();
+                window.set_title(&format!(
+                    "Project3.6k | {:.0} FPS | {:.1} ms avg / {:.1} p95 | renderer {:.2} ms | pos {:.1}, {:.1}, {:.1}",
+                    stats.frames_per_second,
+                    stats.average_frame_ms,
+                    stats.p95_frame_ms,
+                    stats.average_renderer_cpu_ms,
+                    position.x,
+                    position.y,
+                    position.z,
+                ));
+            }
         }
     }
 }

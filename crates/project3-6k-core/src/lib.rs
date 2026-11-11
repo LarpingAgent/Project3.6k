@@ -3,9 +3,11 @@
 use std::time::{Duration, Instant};
 
 mod camera;
+mod profiler;
 mod scene;
 
 pub use camera::Camera;
+pub use profiler::{FrameProfileStats, FrameProfiler};
 pub use scene::{MeshHandle, Scene, SceneError, SceneNode, SceneNodeId, Transform};
 
 /// Monotonic timing information for one application frame.

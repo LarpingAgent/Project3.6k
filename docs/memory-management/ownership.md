@@ -3,6 +3,7 @@
 ## Current CPU ownership
 
 - `FrameClock` stores timestamps and an integer frame counter. `tick` performs no heap allocation.
+- `FrameProfiler` keeps 120 frame intervals and renderer-call durations in a fixed array. Recording and rolling-stat calculation allocate no heap memory.
 - `InputState` allocates only when the set of held keys changes; raw mouse deltas accumulate in a fixed two-value array.
 - The platform-owned `Camera` stores small vector/scalar state and performs no per-frame allocation.
 - Core `Scene` stores a bounded vector of mesh instances; each node carries a value-owned `Transform`. The current forest transforms are baked into GPU vertex data during initialization, so no per-frame scene allocation or dynamic upload occurs.

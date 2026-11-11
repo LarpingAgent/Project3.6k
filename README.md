@@ -12,7 +12,7 @@ Project3.6k is a custom Rust engine foundation for a future first-person forest 
 - Physical keyboard state, raw mouse input, cursor capture/release, and first-person WASD camera controls.
 - Vulkan instance and device selection, native surface, swapchain, render pass, GLSL graphics pipeline, vertex/index buffers, command buffers, fences, semaphores, and swapchain recreation.
 - Debug builds require `VK_LAYER_KHRONOS_validation`; the callback counts and logs warnings/errors and makes the process fail if any occur.
-- Monotonic frame timing and structured `tracing` logs.
+- Monotonic frame timing plus a fixed-size rolling profiler for FPS, average/p95/max frame interval, and renderer-call CPU time.
 
 The renderer currently shows a static planar forest composition using indexed triangles, a first-person perspective camera, per-swapchain depth testing, an embedded repeating sRGB noise texture with CPU-generated mipmaps, and low-poly ambient plus directional diffuse lighting. Vertex colors tint the texture. Gameplay is still future work.
 
@@ -32,7 +32,7 @@ The renderer dynamically loads the system Vulkan loader, so this phase does not 
 cargo run -p project3-6k-app
 ```
 
-Left-click to capture the mouse, use **W/A/S/D** to move and **Space/Shift** to rise or descend. Press **Escape** to release the cursor, then press it again or close the window to exit. Set `RUST_LOG=debug` to see keyboard events and periodic frame timing; `RUST_LOG=project3_6k_vulkan=trace` can be used when additional renderer tracing is added.
+Left-click to capture the mouse, use **W/A/S/D** to move and **Space/Shift** to rise or descend. Press **Escape** to release the cursor, then press it again or close the window to exit. The title bar refreshes every 120 frames with estimated FPS, average/p95 frame interval, mean renderer-call CPU time, and camera position. Set `RUST_LOG=debug` to log the same rolling profile with input events. Renderer-call CPU time includes CPU-side waiting/submission/presentation calls; it is not GPU execution time.
 
 For automated lifecycle checks, `cargo run -p project3-6k-app -- --run-frames 60 --validation` exits after 60 successful submissions through the regular shutdown path. `--auto-close` exits after Vulkan initialization. `--resize-stress` requires `--run-frames N`; it changes size, minimizes, and restores the window, and fails unless a zero-extent event is observed.
 
@@ -43,7 +43,7 @@ Run the full Phase 2 validation smoke suite from PowerShell with `scripts/valida
 | Crate | Responsibility |
 |---|---|
 | `project3-6k-assets` | Bounded CPU-side PNG loading, keyed texture handles, mip generation, and cache lifetime management. |
-| `project3-6k-core` | Platform-neutral frame timing, camera math, bounded scene nodes, and transforms (`glam`). |
+| `project3-6k-core` | Platform-neutral frame timing/profiling, camera math, bounded scene nodes, and transforms (`glam`). |
 | `project3-6k-platform` | `winit` event loop, window lifecycle, keyboard/mouse input, and camera controls. |
 | `project3-6k-vulkan` | Explicit Vulkan instance, surface, device, swapchain, color/depth attachments, synchronization, validation monitoring, per-frame camera uniforms, sampled textures, ambient/directional lighting, and indexed forest rendering. |
 | `project3-6k-app` | Executable entry point and logging setup. |
