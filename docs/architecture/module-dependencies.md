@@ -5,7 +5,7 @@
 | Crate | Depends on | Public responsibility |
 |---|---|---|
 | `project3-6k-core` | `glam` | `FrameClock`, `FrameTime`, and first-person camera math |
-| `project3-6k-vulkan` | `ash`, `ash-window`, `raw-window-handle`, `winit`, `thiserror`, `tracing` | `VulkanRenderer` initialization, resize, and draw API |
+| `project3-6k-vulkan` | `ash`, `ash-window`, `raw-window-handle`, `winit`, `thiserror`, `tracing` | `VulkanRenderer` initialization, color/depth attachments, resize, and draw API |
 | `project3-6k-platform` | core, Vulkan, `winit`, `thiserror`, `tracing` | `run()`, keyboard/mouse `InputState`, and window controls |
 | `project3-6k-app` | platform, `tracing`, `tracing-subscriber` | executable entry point |
 

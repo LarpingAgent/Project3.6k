@@ -11,9 +11,12 @@ mod validation;
 
 use validation::ValidationState;
 pub use validation::{ValidationMonitor, ValidationReport};
+#[path = "depth_buffer.rs"]
+mod depth_buffer;
 #[path = "forest_scene.rs"]
 mod forest_scene;
 
+use depth_buffer::{DepthAttachment, choose_depth_format};
 use forest_scene::ForestScene;
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
@@ -38,6 +41,8 @@ pub enum VulkanRendererError {
     NoPresentModes,
     #[error("the presentation surface does not support color-attachment images")]
     UnsupportedSurfaceUsage,
+    #[error("the selected Vulkan device has no supported depth attachment format")]
+    NoSupportedDepthFormat,
     #[error("Vulkan validation was requested but {0} is unavailable")]
     ValidationUnavailable(&'static str),
     #[error("the embedded GLSL shader could not be decoded: {0}")]
@@ -338,10 +343,12 @@ struct SwapchainState {
     device: ash::Device,
     swapchain: vk::SwapchainKHR,
     format: vk::Format,
+    depth_format: vk::Format,
     extent: vk::Extent2D,
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
+    depth_images: Vec<DepthAttachment>,
     forest_scene: Option<ForestScene>,
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
@@ -368,10 +375,12 @@ impl SwapchainState {
             device,
             swapchain: vk::SwapchainKHR::null(),
             format: vk::Format::UNDEFINED,
+            depth_format: vk::Format::UNDEFINED,
             extent: vk::Extent2D::default(),
             images: Vec::new(),
             image_views: Vec::new(),
             render_pass: vk::RenderPass::null(),
+            depth_images: Vec::new(),
             forest_scene: None,
             framebuffers: Vec::new(),
             command_pool: vk::CommandPool::null(),
@@ -419,6 +428,7 @@ impl SwapchainState {
         let surface_format = choose_surface_format(&formats)?;
         let present_mode = choose_present_mode(&present_modes)?;
         self.format = surface_format.format;
+        self.depth_format = choose_depth_format(&context.instance, context.physical_device)?;
         self.extent = choose_extent(&capabilities, window);
 
         let mut image_count = capabilities.min_image_count.saturating_add(1);
@@ -445,13 +455,21 @@ impl SwapchainState {
         // SAFETY: The new swapchain is live and owned by this state.
         self.images = unsafe { self.loader.get_swapchain_images(self.swapchain)? };
 
-        self.render_pass = create_render_pass(&self.device, self.format)?;
+        self.render_pass = create_render_pass(&self.device, self.format, self.depth_format)?;
         // SAFETY: The physical device belongs to the live Vulkan instance.
         let memory_properties = unsafe {
             context
                 .instance
                 .get_physical_device_memory_properties(context.physical_device)
         };
+        for _ in &self.images {
+            self.depth_images.push(DepthAttachment::new(
+                &self.device,
+                &memory_properties,
+                self.extent,
+                self.depth_format,
+            )?);
+        }
         self.forest_scene = Some(ForestScene::new(
             &self.device,
             &memory_properties,
@@ -476,8 +494,8 @@ impl SwapchainState {
             self.image_views
                 .push(unsafe { self.device.create_image_view(&view_info, None)? });
         }
-        for image_view in &self.image_views {
-            let attachments = [*image_view];
+        for (image_view, depth_image) in self.image_views.iter().zip(&self.depth_images) {
+            let attachments = [*image_view, depth_image.view];
             let framebuffer_info = vk::FramebufferCreateInfo::default()
                 .render_pass(self.render_pass)
                 .attachments(&attachments)
@@ -677,6 +695,7 @@ impl SwapchainState {
                 self.device.destroy_framebuffer(framebuffer, None);
             }
             self.forest_scene.take();
+            self.depth_images.clear();
             for image_view in self.image_views.drain(..).rev() {
                 self.device.destroy_image_view(image_view, None);
             }
@@ -831,29 +850,58 @@ fn choose_composite_alpha(supported: vk::CompositeAlphaFlagsKHR) -> vk::Composit
     .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE)
 }
 
-fn create_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::RenderPass> {
-    let attachments = [vk::AttachmentDescription::default()
-        .format(format)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+fn create_render_pass(
+    device: &ash::Device,
+    format: vk::Format,
+    depth_format: vk::Format,
+) -> Result<vk::RenderPass> {
+    let attachments = [
+        vk::AttachmentDescription::default()
+            .format(format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+        vk::AttachmentDescription::default()
+            .format(depth_format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+    ];
     let color_attachment = [vk::AttachmentReference {
         attachment: 0,
         layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
     }];
+    let depth_attachment = vk::AttachmentReference {
+        attachment: 1,
+        layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
     let subpasses = [vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_attachment)];
+        .color_attachments(&color_attachment)
+        .depth_stencil_attachment(&depth_attachment)];
     let dependencies = [vk::SubpassDependency::default()
         .src_subpass(vk::SUBPASS_EXTERNAL)
         .dst_subpass(0)
-        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+        .src_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        )
+        .dst_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        )
+        .dst_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )];
     let info = vk::RenderPassCreateInfo::default()
         .attachments(&attachments)
         .subpasses(&subpasses)
@@ -877,11 +925,19 @@ fn record_scene_pass(
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         device.begin_command_buffer(command_buffer, &begin_info)?;
-        let clear_values = [vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.025, 0.055, 0.035, 1.0],
+        let clear_values = [
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.025, 0.055, 0.035, 1.0],
+                },
             },
-        }];
+            vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            },
+        ];
         let render_pass_info = vk::RenderPassBeginInfo::default()
             .render_pass(render_pass)
             .framebuffer(framebuffer)

@@ -17,7 +17,11 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 - **NOT VERIFIED BY AUTOMATION** — Press Escape once and confirm the cursor is released while the window remains open; press Escape again and confirm the app closes normally.
 - **NOT VERIFIED BY AUTOMATION** — Focus another window while captured, then return; confirm held keys are cleared and the cursor is released safely.
 
+## Phase 3d depth
+
+- **NOT VERIFIED BY AUTOMATION** — Confirm the forest ridge remains behind the trees even though its indexed draw range is submitted after them; resize repeatedly and confirm the depth image recreates without flicker or stale occlusion.
+
 ## Future renderer milestones
 
-- Add checks for depth ordering, texture appearance, and lighting when those features exist.
+- Add checks for texture appearance and lighting when those features exist.
 - Add checks for the final forest demo's visual quality and behavior on a second Vulkan-capable GPU when one is available.

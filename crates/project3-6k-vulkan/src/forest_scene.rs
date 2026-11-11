@@ -159,6 +159,10 @@ const INDICES: [u16; 39] = [
     20, 22, 23, 24, 25, 26, 27, 28, 29, 27, 29, 30,
 ];
 
+// Ground and trees are submitted first; the farther ridge is intentionally submitted last.
+// Depth testing must keep the nearer geometry in front of it.
+const MESH_DRAW_RANGES: [(u32, u32); 5] = [(0, 6), (12, 9), (21, 9), (30, 9), (6, 6)];
+
 pub(super) struct ForestScene {
     device: ash::Device,
     descriptor_set_layout: vk::DescriptorSetLayout,
@@ -254,6 +258,12 @@ impl ForestScene {
             .line_width(1.0);
         let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS)
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false);
         let color_attachments = [vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(vk::ColorComponentFlags::RGBA)];
         let color_blending =
@@ -268,6 +278,7 @@ impl ForestScene {
             .viewport_state(&viewport_state)
             .rasterization_state(&rasterization)
             .multisample_state(&multisampling)
+            .depth_stencil_state(&depth_stencil)
             .color_blend_state(&color_blending)
             .dynamic_state(&dynamic_state)
             .layout(scene.pipeline_layout)
@@ -330,14 +341,18 @@ impl ForestScene {
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
 
-        let gpu_vertices = VERTICES.map(|vertex| ForestGpuVertex {
-            position: [
-                vertex.position[0] * FOREST_PLANE_SCALE[0],
-                vertex.position[1] * FOREST_PLANE_SCALE[1],
-                0.0,
-            ],
-            color: vertex.color,
-        });
+        let gpu_vertices = VERTICES
+            .iter()
+            .enumerate()
+            .map(|(index, vertex)| ForestGpuVertex {
+                position: [
+                    vertex.position[0] * FOREST_PLANE_SCALE[0],
+                    vertex.position[1] * FOREST_PLANE_SCALE[1],
+                    mesh_vertex_depth(index),
+                ],
+                color: vertex.color,
+            })
+            .collect::<Vec<_>>();
         let vertex_data = gpu_vertex_bytes(&gpu_vertices);
         let index_data = index_bytes(&INDICES);
         let vertex_size = vertex_data.len();
@@ -457,8 +472,10 @@ impl ForestScene {
                 0,
                 vk::IndexType::UINT16,
             );
-            self.device
-                .cmd_draw_indexed(command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
+            for (first_index, index_count) in MESH_DRAW_RANGES {
+                self.device
+                    .cmd_draw_indexed(command_buffer, index_count, 1, first_index, 0, 0);
+            }
         }
     }
 }
@@ -768,6 +785,17 @@ fn gpu_vertex_bytes(values: &[ForestGpuVertex]) -> &[u8] {
     }
 }
 
+fn mesh_vertex_depth(index: usize) -> f32 {
+    match index {
+        0..=3 => 0.0,
+        4..=9 => -0.45,
+        10..=16 => 0.1,
+        17..=23 => 0.25,
+        24..=30 => 0.1,
+        _ => unreachable!("mesh vertex index validated by the static vertex table"),
+    }
+}
+
 fn matrix_bytes(values: &[[f32; 4]; 4]) -> &[u8] {
     // SAFETY: The matrix is exactly sixteen initialized f32 values with no padding between them.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
@@ -782,7 +810,10 @@ fn index_bytes(values: &[u16]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use super::{INDICES, VERTICES, VulkanRendererError, align_up_4, select_memory_type};
+    use super::{
+        INDICES, MESH_DRAW_RANGES, VERTICES, VulkanRendererError, align_up_4, mesh_vertex_depth,
+        select_memory_type,
+    };
     use ash::vk;
 
     #[test]
@@ -793,6 +824,27 @@ mod tests {
                 .iter()
                 .all(|index| (*index as usize) < VERTICES.len())
         );
+    }
+
+    #[test]
+    fn forest_mesh_draw_ranges_cover_each_triangle_once() {
+        let mut covered = vec![false; INDICES.len()];
+        for (first_index, index_count) in MESH_DRAW_RANGES {
+            assert_eq!(index_count % 3, 0);
+            let first = first_index as usize;
+            let end = (first_index + index_count) as usize;
+            for range in covered.iter_mut().take(end).skip(first) {
+                assert!(!*range);
+                *range = true;
+            }
+        }
+        assert!(covered.into_iter().all(|range| range));
+    }
+
+    #[test]
+    fn far_ridge_is_drawn_after_nearer_tree_meshes() {
+        assert_eq!(MESH_DRAW_RANGES.last(), Some(&(6, 6)));
+        assert!(mesh_vertex_depth(4) < mesh_vertex_depth(17));
     }
 
     #[test]
