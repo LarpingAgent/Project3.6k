@@ -164,6 +164,8 @@ impl ForestScene {
         device: &ash::Device,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
         render_pass: vk::RenderPass,
+        graphics_queue: vk::Queue,
+        queue_family_index: u32,
     ) -> Result<Self> {
         let mut scene = Self {
             device: device.clone(),
@@ -261,18 +263,59 @@ impl ForestScene {
             }
         };
 
-        scene.vertex_buffer = Some(BufferAllocation::new(
+        let vertex_data = bytemuck_bytes(&VERTICES);
+        let index_data = index_bytes(&INDICES);
+        let vertex_size = vertex_data.len();
+        let index_offset = align_up_4(vertex_size);
+        let index_copy_size = align_up_4(index_data.len());
+        let mut staging_data = vec![0; index_offset + index_copy_size];
+        staging_data[..vertex_size].copy_from_slice(vertex_data);
+        staging_data[index_offset..index_offset + index_data.len()].copy_from_slice(index_data);
+
+        let staging = BufferAllocation::new(
             device,
             memory_properties,
-            bytemuck_bytes(&VERTICES),
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-        )?);
-        scene.index_buffer = Some(BufferAllocation::new(
+            staging_data.len(),
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE,
+            vk::MemoryPropertyFlags::HOST_COHERENT,
+            "host-visible staging",
+        )?;
+        staging.upload(&staging_data)?;
+
+        let vertex_buffer = BufferAllocation::new(
             device,
             memory_properties,
-            index_bytes(&INDICES),
-            vk::BufferUsageFlags::INDEX_BUFFER,
-        )?);
+            vertex_size,
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            "device-local vertex",
+        )?;
+        let index_buffer = BufferAllocation::new(
+            device,
+            memory_properties,
+            index_copy_size,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            "device-local index",
+        )?;
+        upload_static_mesh(
+            device,
+            graphics_queue,
+            queue_family_index,
+            &staging,
+            &vertex_buffer,
+            &index_buffer,
+            MeshUploadLayout {
+                vertex_size: vertex_size as u64,
+                index_offset: index_offset as u64,
+                index_copy_size: index_copy_size as u64,
+            },
+        )?;
+        scene.vertex_buffer = Some(vertex_buffer);
+        scene.index_buffer = Some(index_buffer);
         Ok(scene)
     }
 
@@ -325,7 +368,7 @@ impl ForestScene {
 
 impl Drop for ForestScene {
     fn drop(&mut self) {
-        // The owning swapchain waits for device idle before releasing this scene.
+        // SAFETY: The owning swapchain waits for device idle before releasing this scene.
         unsafe {
             if self.pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.pipeline, None);
@@ -368,17 +411,22 @@ struct BufferAllocation {
     device: ash::Device,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    size: vk::DeviceSize,
+    memory_flags: vk::MemoryPropertyFlags,
 }
 
 impl BufferAllocation {
     fn new(
         device: &ash::Device,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
-        data: &[u8],
+        size: usize,
         usage: vk::BufferUsageFlags,
+        required_memory: vk::MemoryPropertyFlags,
+        preferred_memory: vk::MemoryPropertyFlags,
+        memory_description: &'static str,
     ) -> Result<Self> {
         let buffer_info = vk::BufferCreateInfo::default()
-            .size(data.len() as u64)
+            .size(size as vk::DeviceSize)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: The buffer uses a valid nonzero size and an explicit GPU usage.
@@ -387,54 +435,48 @@ impl BufferAllocation {
             device: device.clone(),
             buffer,
             memory: vk::DeviceMemory::null(),
+            size: size as vk::DeviceSize,
+            memory_flags: vk::MemoryPropertyFlags::empty(),
         };
-        allocation.upload(memory_properties, data)?;
-        Ok(allocation)
-    }
-
-    fn upload(
-        &mut self,
-        memory_properties: &vk::PhysicalDeviceMemoryProperties,
-        data: &[u8],
-    ) -> Result<()> {
         // SAFETY: The buffer is live and owned by this allocation.
-        let requirements = unsafe { self.device.get_buffer_memory_requirements(self.buffer) };
-        let mut host_visible_type = None;
-        let mut coherent_type = None;
-        for index in 0..memory_properties.memory_type_count {
-            if requirements.memory_type_bits & (1 << index) == 0 {
-                continue;
-            }
-            let memory_type = memory_properties.memory_types[index as usize];
-            if memory_type
-                .property_flags
-                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
-            {
-                host_visible_type.get_or_insert(index);
-                if memory_type.property_flags.contains(
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                ) {
-                    coherent_type = Some(index);
-                    break;
-                }
-            }
-        }
-        let memory_type_index = coherent_type
-            .or(host_visible_type)
-            .ok_or(VulkanRendererError::NoHostVisibleMemory)?;
-        let coherent = memory_properties.memory_types[memory_type_index as usize]
-            .property_flags
-            .contains(vk::MemoryPropertyFlags::HOST_COHERENT);
+        let requirements = unsafe { allocation.device.get_buffer_memory_requirements(buffer) };
+        let (memory_type_index, memory_flags) = select_memory_type(
+            memory_properties,
+            &requirements,
+            required_memory,
+            preferred_memory,
+            memory_description,
+        )?;
         let allocation_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(memory_type_index);
-        // SAFETY: The memory type is compatible with this buffer and allocation size meets requirements.
-        self.memory = unsafe { self.device.allocate_memory(&allocation_info, None)? };
-        // SAFETY: Buffer and memory belong to the same device and are not yet bound elsewhere.
+        // SAFETY: The selected memory type is compatible with the buffer and meets its size requirement.
+        allocation.memory = unsafe { allocation.device.allocate_memory(&allocation_info, None)? };
+        allocation.memory_flags = memory_flags;
+        // SAFETY: Buffer and memory belong to the same device and are not bound elsewhere.
         unsafe {
-            self.device
-                .bind_buffer_memory(self.buffer, self.memory, 0)?
+            allocation
+                .device
+                .bind_buffer_memory(allocation.buffer, allocation.memory, 0)?
         };
+        Ok(allocation)
+    }
+
+    fn upload(&self, data: &[u8]) -> Result<()> {
+        if data.len() as vk::DeviceSize > self.size {
+            return Err(VulkanRendererError::BufferUploadTooLarge {
+                actual: data.len(),
+                capacity: self.size,
+            });
+        }
+        if !self
+            .memory_flags
+            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+        {
+            return Err(VulkanRendererError::NoCompatibleMemory(
+                "host-visible upload",
+            ));
+        }
         // SAFETY: The allocation is host-visible and remains mapped only for this upload.
         let mapped = unsafe {
             self.device
@@ -445,7 +487,10 @@ impl BufferAllocation {
         unsafe {
             ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len());
         }
-        let flush_result = if !coherent {
+        let flush_result = if !self
+            .memory_flags
+            .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+        {
             let range = [vk::MappedMemoryRange::default()
                 .memory(self.memory)
                 .offset(0)
@@ -462,9 +507,140 @@ impl BufferAllocation {
     }
 }
 
+fn select_memory_type(
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    requirements: &vk::MemoryRequirements,
+    required: vk::MemoryPropertyFlags,
+    preferred: vk::MemoryPropertyFlags,
+    description: &'static str,
+) -> Result<(u32, vk::MemoryPropertyFlags)> {
+    let mut fallback = None;
+    for index in 0..memory_properties.memory_type_count {
+        if requirements.memory_type_bits & (1 << index) == 0 {
+            continue;
+        }
+        let flags = memory_properties.memory_types[index as usize].property_flags;
+        if !flags.contains(required) {
+            continue;
+        }
+        fallback.get_or_insert((index, flags));
+        if flags.contains(required | preferred) {
+            return Ok((index, flags));
+        }
+    }
+    fallback.ok_or(VulkanRendererError::NoCompatibleMemory(description))
+}
+
+struct MeshUploadLayout {
+    vertex_size: u64,
+    index_offset: u64,
+    index_copy_size: u64,
+}
+
+fn upload_static_mesh(
+    device: &ash::Device,
+    queue: vk::Queue,
+    queue_family_index: u32,
+    staging: &BufferAllocation,
+    vertex_buffer: &BufferAllocation,
+    index_buffer: &BufferAllocation,
+    layout: MeshUploadLayout,
+) -> Result<()> {
+    let pool_info = vk::CommandPoolCreateInfo::default()
+        .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+        .queue_family_index(queue_family_index);
+    // SAFETY: The queue family supports graphics and therefore transfer commands.
+    let command_pool = unsafe { device.create_command_pool(&pool_info, None)? };
+    let result = (|| {
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // SAFETY: The transient pool is live and allocated for this queue family.
+        let command_buffers = unsafe { device.allocate_command_buffers(&allocate_info)? };
+        let command_buffer = command_buffers[0];
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: The command buffer is freshly allocated and not in flight.
+        unsafe { device.begin_command_buffer(command_buffer, &begin_info)? };
+        let copies = [
+            vk::BufferCopy::default().size(layout.vertex_size),
+            vk::BufferCopy::default()
+                .src_offset(layout.index_offset)
+                .size(layout.index_copy_size),
+        ];
+        // SAFETY: Source and destination buffers are live, the copied ranges fit, and both
+        // copy sizes and offsets are four-byte aligned as required by vkCmdCopyBuffer.
+        unsafe {
+            device.cmd_copy_buffer(
+                command_buffer,
+                staging.buffer,
+                vertex_buffer.buffer,
+                &copies[..1],
+            );
+            device.cmd_copy_buffer(
+                command_buffer,
+                staging.buffer,
+                index_buffer.buffer,
+                &copies[1..],
+            );
+            let buffer_barriers = [
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::VERTEX_ATTRIBUTE_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(vertex_buffer.buffer)
+                    .offset(0)
+                    .size(layout.vertex_size),
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::INDEX_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(index_buffer.buffer)
+                    .offset(0)
+                    .size(layout.index_copy_size),
+            ];
+            // SAFETY: The buffer ranges were written by the preceding transfer operations and
+            // the destination access masks match the later vertex-input reads on this queue.
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::VERTEX_INPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &buffer_barriers,
+                &[],
+            );
+            device.end_command_buffer(command_buffer)?;
+        }
+        let command_buffers = [command_buffer];
+        let submissions = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+        // SAFETY: This queue is idle during initialization/recreation and the command buffer
+        // references only live buffers that remain owned until queue_wait_idle completes.
+        unsafe {
+            device.queue_submit(queue, &submissions, vk::Fence::null())?;
+            device.queue_wait_idle(queue)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        // SAFETY: Best-effort idle before destroying the transient pool on an upload error.
+        let _ = unsafe { device.device_wait_idle() };
+    }
+    // SAFETY: The queue has been idled on success; on error the device was idled above.
+    unsafe { device.destroy_command_pool(command_pool, None) };
+    result
+}
+
+fn align_up_4(size: usize) -> usize {
+    (size + 3) & !3
+}
+
 impl Drop for BufferAllocation {
     fn drop(&mut self) {
-        // The scene owner idles the device before destruction or drops this allocation before
+        // SAFETY: The scene owner idles the device before destruction or drops this allocation before
         // any command using it has been submitted.
         unsafe {
             if self.buffer != vk::Buffer::null() {
@@ -489,5 +665,86 @@ fn index_bytes(values: &[u16]) -> &[u8] {
     // SAFETY: Every u16 is initialized and has no padding; the output covers the same allocation.
     unsafe {
         std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INDICES, VERTICES, VulkanRendererError, align_up_4, select_memory_type};
+    use ash::vk;
+
+    #[test]
+    fn forest_mesh_indices_reference_complete_triangles() {
+        assert_eq!(INDICES.len() % 3, 0);
+        assert!(
+            INDICES
+                .iter()
+                .all(|index| (*index as usize) < VERTICES.len())
+        );
+    }
+
+    #[test]
+    fn memory_selection_prefers_coherent_host_memory() {
+        let memory_types = std::array::from_fn(|index| {
+            let property_flags = match index {
+                0 => vk::MemoryPropertyFlags::HOST_VISIBLE,
+                1 => vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                _ => vk::MemoryPropertyFlags::empty(),
+            };
+            vk::MemoryType {
+                property_flags,
+                heap_index: 0,
+            }
+        });
+        let properties = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 2,
+            memory_types,
+            ..Default::default()
+        };
+        let requirements = vk::MemoryRequirements {
+            memory_type_bits: 0b11,
+            ..Default::default()
+        };
+
+        let (index, flags) = select_memory_type(
+            &properties,
+            &requirements,
+            vk::MemoryPropertyFlags::HOST_VISIBLE,
+            vk::MemoryPropertyFlags::HOST_COHERENT,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(index, 1);
+        assert!(flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT));
+    }
+
+    #[test]
+    fn memory_selection_reports_missing_required_properties() {
+        let properties = vk::PhysicalDeviceMemoryProperties::default();
+        let requirements = vk::MemoryRequirements {
+            memory_type_bits: 1,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            select_memory_type(
+                &properties,
+                &requirements,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                vk::MemoryPropertyFlags::empty(),
+                "device-local vertex",
+            ),
+            Err(VulkanRendererError::NoCompatibleMemory(
+                "device-local vertex"
+            ))
+        ));
+    }
+
+    #[test]
+    fn staging_offsets_and_copy_sizes_are_four_byte_aligned() {
+        assert_eq!(align_up_4(0), 0);
+        assert_eq!(align_up_4(1), 4);
+        assert_eq!(align_up_4(620), 620);
+        assert_eq!(align_up_4(78), 80);
     }
 }

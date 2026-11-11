@@ -42,8 +42,13 @@ pub enum VulkanRendererError {
     ValidationUnavailable(&'static str),
     #[error("the embedded GLSL shader could not be decoded: {0}")]
     InvalidShader(#[source] std::io::Error),
-    #[error("the selected Vulkan device has no compatible host-visible memory for scene data")]
-    NoHostVisibleMemory,
+    #[error("the selected Vulkan device has no compatible {0} memory type")]
+    NoCompatibleMemory(&'static str),
+    #[error("mesh upload contains {actual} bytes but the buffer holds only {capacity} bytes")]
+    BufferUploadTooLarge {
+        actual: usize,
+        capacity: vk::DeviceSize,
+    },
 }
 
 type Result<T> = std::result::Result<T, VulkanRendererError>;
@@ -451,6 +456,8 @@ impl SwapchainState {
             &self.device,
             &memory_properties,
             self.render_pass,
+            context.graphics_queue,
+            context.queue_family_index,
         )?);
         for image in &self.images {
             let view_info = vk::ImageViewCreateInfo::default()

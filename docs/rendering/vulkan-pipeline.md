@@ -40,4 +40,4 @@ Run `scripts/validation-smoke.ps1` to execute the 1, 60, and 600 frame runs and 
 
 ## Next rendering steps
 
-The shader build path invokes `glslc` from `VULKAN_SDK` and writes SPIR-V to Cargo's `OUT_DIR`; no compiler dependency or committed shader binaries are needed. The next rendering steps are camera uniforms, perspective projection, depth testing, textured geometry, and basic lighting. GPU suballocation and staging uploads will be evaluated as mesh/resource requirements grow. Shadow maps, PBR, and large-world systems remain later extensions.
+The shader build path invokes `glslc` from `VULKAN_SDK` and writes SPIR-V to Cargo's `OUT_DIR`; no compiler dependency or committed shader binaries are needed. Static mesh data is copied through a temporary host-visible staging buffer into device-local vertex/index buffers, with an explicit transfer-to-vertex-input barrier. The next rendering steps are camera uniforms, perspective projection, depth testing, textured geometry, and basic lighting. Shadow maps, PBR, and large-world systems remain later extensions.
