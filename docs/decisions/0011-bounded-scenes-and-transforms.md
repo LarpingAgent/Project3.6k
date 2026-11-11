@@ -14,6 +14,10 @@ The forest renderer currently stores one flat vertex array and hard-codes vertex
 
 Add a bounded `Scene` to the core crate. A scene stores ordered nodes that reference opaque mesh handles and validated translation/rotation/scale transforms. Transform creation rejects non-finite and singular inputs, normalizes quaternions, and supplies point and inverse-transpose normal transforms. The renderer builds the five static forest nodes, applies their transforms while assembling the vertex upload, and uses node order to submit corresponding indexed ranges.
 
+## Follow-up
+
+Decision [0013](0013-spatial-low-poly-forest.md) expands this scene to six bounded nodes: the ground plane, forest panel, three trees, and distant ridge. The static geometry builder now generates the mesh vertices and normals before applying the same one-time transform bake and indexed-range mapping.
+
 ## Consequences
 
 Core scene data has no dependency on Vulkan or platform input. Static geometry incurs no per-frame transform work. Runtime transform changes currently require rebuilding/updating GPU vertex data; dynamic object buffers, hierarchical parents, materials, and entity deletion policies remain future extensions. Scene capacity is explicit to avoid unbounded node growth.

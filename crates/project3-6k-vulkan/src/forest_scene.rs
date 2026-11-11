@@ -2,178 +2,18 @@ use std::{io::Cursor, mem::size_of, ptr};
 
 use ash::vk;
 
+use super::forest_mesh::{ForestGpuVertex, build_forest_geometry, index_bytes, vertex_bytes};
 use super::{Result, VulkanRendererError};
-use glam::{Quat, Vec3};
 use project3_6k_assets::{AssetManager, TextureAsset};
-use project3_6k_core::{MeshHandle, Scene, SceneNode, Transform};
+use project3_6k_core::Scene;
 
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.vert.spv"));
 const FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.frag.spv"));
 const FOREST_TEXTURE_PNG: &[u8] = include_bytes!("../../../assets/forest_noise.png");
-const FOREST_PLANE_SCALE: [f32; 2] = [2.2581, 1.2702];
-const FOREST_NODE_TRANSFORMS: [(u32, f32); 5] =
-    [(0, 0.0), (1, 0.1), (2, 0.25), (3, 0.1), (4, -0.45)];
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ForestVertex {
-    position: [f32; 2],
-    color: [f32; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ForestGpuVertex {
-    position: [f32; 3],
-    color: [f32; 3],
-    uv: [f32; 2],
-    normal: [f32; 3],
-}
-
-const VERTICES: [ForestVertex; 31] = [
-    // Forest floor.
-    ForestVertex {
-        position: [-1.0, -0.56],
-        color: [0.09, 0.22, 0.11],
-    },
-    ForestVertex {
-        position: [1.0, -0.56],
-        color: [0.09, 0.22, 0.11],
-    },
-    ForestVertex {
-        position: [1.0, -1.0],
-        color: [0.035, 0.12, 0.065],
-    },
-    ForestVertex {
-        position: [-1.0, -1.0],
-        color: [0.035, 0.12, 0.065],
-    },
-    // Distant ridge.
-    ForestVertex {
-        position: [-1.0, -0.38],
-        color: [0.08, 0.19, 0.14],
-    },
-    ForestVertex {
-        position: [-0.52, 0.3],
-        color: [0.08, 0.19, 0.14],
-    },
-    ForestVertex {
-        position: [-0.12, -0.38],
-        color: [0.08, 0.19, 0.14],
-    },
-    ForestVertex {
-        position: [-0.38, -0.38],
-        color: [0.07, 0.17, 0.12],
-    },
-    ForestVertex {
-        position: [0.12, 0.43],
-        color: [0.07, 0.17, 0.12],
-    },
-    ForestVertex {
-        position: [0.62, -0.38],
-        color: [0.07, 0.17, 0.12],
-    },
-    // Left tree canopy and trunk.
-    ForestVertex {
-        position: [-0.84, -0.06],
-        color: [0.12, 0.34, 0.16],
-    },
-    ForestVertex {
-        position: [-0.48, -0.06],
-        color: [0.12, 0.34, 0.16],
-    },
-    ForestVertex {
-        position: [-0.66, 0.62],
-        color: [0.2, 0.46, 0.2],
-    },
-    ForestVertex {
-        position: [-0.71, -0.07],
-        color: [0.3, 0.19, 0.1],
-    },
-    ForestVertex {
-        position: [-0.61, -0.07],
-        color: [0.3, 0.19, 0.1],
-    },
-    ForestVertex {
-        position: [-0.61, -0.56],
-        color: [0.2, 0.12, 0.07],
-    },
-    ForestVertex {
-        position: [-0.71, -0.56],
-        color: [0.2, 0.12, 0.07],
-    },
-    // Center tree.
-    ForestVertex {
-        position: [-0.22, -0.02],
-        color: [0.09, 0.29, 0.13],
-    },
-    ForestVertex {
-        position: [0.22, -0.02],
-        color: [0.09, 0.29, 0.13],
-    },
-    ForestVertex {
-        position: [0.0, 0.86],
-        color: [0.17, 0.42, 0.18],
-    },
-    ForestVertex {
-        position: [-0.055, -0.03],
-        color: [0.32, 0.2, 0.1],
-    },
-    ForestVertex {
-        position: [0.055, -0.03],
-        color: [0.32, 0.2, 0.1],
-    },
-    ForestVertex {
-        position: [0.055, -0.56],
-        color: [0.21, 0.13, 0.07],
-    },
-    ForestVertex {
-        position: [-0.055, -0.56],
-        color: [0.21, 0.13, 0.07],
-    },
-    // Right tree canopy.
-    ForestVertex {
-        position: [0.45, -0.04],
-        color: [0.11, 0.31, 0.14],
-    },
-    ForestVertex {
-        position: [0.81, -0.04],
-        color: [0.11, 0.31, 0.14],
-    },
-    ForestVertex {
-        position: [0.63, 0.62],
-        color: [0.19, 0.43, 0.18],
-    },
-    ForestVertex {
-        position: [0.58, -0.05],
-        color: [0.3, 0.19, 0.1],
-    },
-    ForestVertex {
-        position: [0.68, -0.05],
-        color: [0.3, 0.19, 0.1],
-    },
-    ForestVertex {
-        position: [0.68, -0.56],
-        color: [0.2, 0.12, 0.07],
-    },
-    ForestVertex {
-        position: [0.58, -0.56],
-        color: [0.2, 0.12, 0.07],
-    },
-];
-
-const INDICES: [u16; 39] = [
-    0, 1, 2, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 13, 15, 16, 17, 18, 19, 20, 21, 22,
-    20, 22, 23, 24, 25, 26, 27, 28, 29, 27, 29, 30,
-];
-
-// Ground and trees are submitted first; the farther ridge is intentionally submitted last.
-// Depth testing must keep the nearer geometry in front of it.
-const MESH_DRAW_RANGES: [(u32, u32); 5] = [(0, 6), (12, 9), (21, 9), (30, 9), (6, 6)];
-
 pub(super) struct ForestScene {
     device: ash::Device,
     scene: Scene,
+    draw_ranges: Vec<(u32, u32)>,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
@@ -194,10 +34,11 @@ impl ForestScene {
         queue_family_index: u32,
         texture_format: vk::Format,
     ) -> Result<Self> {
-        let render_scene = create_forest_scene()?;
+        let geometry = build_forest_geometry()?;
         let mut scene = Self {
             device: device.clone(),
-            scene: render_scene,
+            scene: geometry.scene,
+            draw_ranges: geometry.draw_ranges,
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_sets: Vec::new(),
@@ -409,27 +250,8 @@ impl ForestScene {
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
 
-        let gpu_vertices = VERTICES
-            .iter()
-            .enumerate()
-            .map(|(index, vertex)| ForestGpuVertex {
-                position: scene_node_for_vertex(&scene.scene, index)
-                    .transform()
-                    .transform_point(Vec3::new(vertex.position[0], vertex.position[1], 0.0))
-                    .to_array(),
-                color: vertex.color,
-                uv: [
-                    (vertex.position[0] + 1.0) * 4.0,
-                    (1.0 - vertex.position[1]) * 4.0,
-                ],
-                normal: scene_node_for_vertex(&scene.scene, index)
-                    .transform()
-                    .transform_normal(Vec3::from_array(forest_vertex_normal(index)))
-                    .to_array(),
-            })
-            .collect::<Vec<_>>();
-        let vertex_data = gpu_vertex_bytes(&gpu_vertices);
-        let index_data = index_bytes(&INDICES);
+        let vertex_data = vertex_bytes(&geometry.vertices);
+        let index_data = index_bytes(&geometry.indices);
         let vertex_size = vertex_data.len();
         let index_offset = align_up_4(vertex_size);
         let index_copy_size = align_up_4(index_data.len());
@@ -548,7 +370,7 @@ impl ForestScene {
                 vk::IndexType::UINT16,
             );
             for node in self.scene.nodes() {
-                let (first_index, index_count) = MESH_DRAW_RANGES[node.mesh().index() as usize];
+                let (first_index, index_count) = self.draw_ranges[node.mesh().index() as usize];
                 self.device
                     .cmd_draw_indexed(command_buffer, index_count, 1, first_index, 0, 0);
             }
@@ -853,70 +675,9 @@ impl Drop for BufferAllocation {
     }
 }
 
-fn gpu_vertex_bytes(values: &[ForestGpuVertex]) -> &[u8] {
-    // SAFETY: `ForestGpuVertex` is repr(C) and consists of eleven initialized f32 values, so it
-    // has no padding bytes. The returned slice is bounded by the source allocation.
-    unsafe {
-        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-    }
-}
-
-fn forest_vertex_normal(index: usize) -> [f32; 3] {
-    match index {
-        0..=3 => [0.0, 0.2, 0.98],
-        4..=9 => [0.0, 0.0, 1.0],
-        10..=12 => [-0.36, 0.3, 0.88],
-        13..=16 => [0.0, 0.0, 1.0],
-        17..=19 => [0.0, 0.39, 0.92],
-        20..=23 => [0.0, 0.0, 1.0],
-        24..=26 => [0.36, 0.3, 0.88],
-        27..=30 => [0.0, 0.0, 1.0],
-        _ => unreachable!("mesh vertex index validated by the static vertex table"),
-    }
-}
-
-fn create_forest_scene() -> Result<Scene> {
-    let mut scene = Scene::new(FOREST_NODE_TRANSFORMS.len());
-    let scale = Vec3::new(FOREST_PLANE_SCALE[0], FOREST_PLANE_SCALE[1], 1.0);
-    for (mesh_index, depth) in FOREST_NODE_TRANSFORMS {
-        let transform = Transform::from_trs(Vec3::new(0.0, 0.0, depth), Quat::IDENTITY, scale)
-            .expect("the fixed forest transforms are finite and non-singular");
-        scene.add_node(MeshHandle::new(mesh_index), transform)?;
-    }
-    Ok(scene)
-}
-
-fn mesh_handle_for_vertex(index: usize) -> MeshHandle {
-    let mesh_index = match index {
-        0..=3 => 0,
-        4..=9 => 4,
-        10..=16 => 1,
-        17..=23 => 2,
-        24..=30 => 3,
-        _ => unreachable!("mesh vertex index validated by the static vertex table"),
-    };
-    MeshHandle::new(mesh_index)
-}
-
-fn scene_node_for_vertex(scene: &Scene, vertex_index: usize) -> SceneNode {
-    let mesh = mesh_handle_for_vertex(vertex_index);
-    *scene
-        .nodes()
-        .iter()
-        .find(|node| node.mesh() == mesh)
-        .expect("every forest vertex belongs to one scene mesh")
-}
-
 fn matrix_bytes(values: &[[f32; 4]; 4]) -> &[u8] {
     // SAFETY: The matrix is exactly sixteen initialized f32 values with no padding between them.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
-}
-
-fn index_bytes(values: &[u16]) -> &[u8] {
-    // SAFETY: Every u16 is initialized and has no padding; the output covers the same allocation.
-    unsafe {
-        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-    }
 }
 
 struct TextureResource {
@@ -1172,87 +933,8 @@ impl Drop for TextureResource {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FOREST_NODE_TRANSFORMS, INDICES, MESH_DRAW_RANGES, VERTICES, VulkanRendererError,
-        align_up_4, create_forest_scene, forest_vertex_normal, mesh_handle_for_vertex,
-        scene_node_for_vertex, select_memory_type,
-    };
+    use super::{VulkanRendererError, align_up_4, select_memory_type};
     use ash::vk;
-
-    #[test]
-    fn forest_mesh_indices_reference_complete_triangles() {
-        assert_eq!(INDICES.len() % 3, 0);
-        assert!(
-            INDICES
-                .iter()
-                .all(|index| (*index as usize) < VERTICES.len())
-        );
-    }
-
-    #[test]
-    fn forest_mesh_draw_ranges_cover_each_triangle_once() {
-        let mut covered = vec![false; INDICES.len()];
-        for (first_index, index_count) in MESH_DRAW_RANGES {
-            assert_eq!(index_count % 3, 0);
-            let first = first_index as usize;
-            let end = (first_index + index_count) as usize;
-            for range in covered.iter_mut().take(end).skip(first) {
-                assert!(!*range);
-                *range = true;
-            }
-        }
-        assert!(covered.into_iter().all(|range| range));
-    }
-
-    #[test]
-    fn far_ridge_is_drawn_after_nearer_tree_meshes() {
-        let scene = create_forest_scene().unwrap();
-        let ridge = scene.nodes().last().unwrap();
-        let center_tree = scene
-            .nodes()
-            .iter()
-            .find(|node| node.mesh().index() == 2)
-            .unwrap();
-
-        assert_eq!(ridge.mesh().index(), 4);
-        assert!(ridge.transform().translation().z < center_tree.transform().translation().z);
-    }
-
-    #[test]
-    fn forest_scene_transforms_bound_mesh_instances_and_mesh_vertices() {
-        let scene = create_forest_scene().unwrap();
-        assert_eq!(scene.nodes().len(), FOREST_NODE_TRANSFORMS.len());
-        assert_eq!(scene.max_nodes(), FOREST_NODE_TRANSFORMS.len());
-        assert_eq!(mesh_handle_for_vertex(4).index(), 4);
-        assert_eq!(mesh_handle_for_vertex(12).index(), 1);
-
-        let ground = scene_node_for_vertex(&scene, 0);
-        let world_point = ground
-            .transform()
-            .transform_point(glam::Vec3::new(-1.0, -0.56, 0.0));
-        assert!((world_point.x + 2.2581).abs() < 0.0001);
-        assert!((world_point.y + 0.711312).abs() < 0.0001);
-    }
-
-    #[test]
-    fn forest_surfaces_have_finite_stylized_normals_for_directional_lighting() {
-        let normals = (0..VERTICES.len())
-            .map(forest_vertex_normal)
-            .collect::<Vec<_>>();
-        assert!(normals.iter().all(|normal| {
-            normal.iter().all(|component| component.is_finite())
-                && (normal
-                    .iter()
-                    .map(|component| component * component)
-                    .sum::<f32>()
-                    .sqrt()
-                    - 1.0)
-                    .abs()
-                    < 0.01
-        }));
-        assert!(forest_vertex_normal(10)[0] < 0.0);
-        assert!(forest_vertex_normal(24)[0] > 0.0);
-    }
 
     #[test]
     fn memory_selection_prefers_coherent_host_memory() {

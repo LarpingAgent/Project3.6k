@@ -17,3 +17,7 @@ Add a normal attribute to the static vertex stream. Use authored, normalized wor
 ## Consequences
 
 Canopy facets respond differently to the fixed light while the scene remains inexpensive and compatible with the Vulkan 1.0 pipeline. Because the scene is still planar and its normals are authored, this is a starter lighting model rather than a general material/lighting system. Mesh-derived normals, dynamic lights, specular response, shadows, and PBR remain future work. Interactive shading quality is recorded in the manual checklist.
+
+## Follow-up
+
+Decision [0013](0013-spatial-low-poly-forest.md) replaces the planar silhouettes with shallow prisms and a ground plane. The fixed lighting model remains; the geometry builder now supplies face and side normals. Interactive shading quality remains a manual check.

@@ -14,7 +14,7 @@ Project3.6k is a custom Rust engine foundation for a future first-person forest 
 - Debug builds require `VK_LAYER_KHRONOS_validation`; the callback counts and logs warnings/errors and makes the process fail if any occur.
 - Monotonic frame timing plus a fixed-size rolling profiler for FPS, average/p95/max frame interval, and renderer-call CPU time.
 
-The renderer currently shows a static planar forest composition using indexed triangles, a first-person perspective camera, per-swapchain depth testing, an embedded repeating sRGB noise texture with CPU-generated mipmaps, and low-poly ambient plus directional diffuse lighting. Vertex colors tint the texture. Gameplay is still future work.
+The renderer builds a static spatial forest scene from a horizontal textured ground plane and shallow low-poly prisms for the trees and distant ridge. It uses indexed draws, a first-person perspective camera, per-swapchain depth testing, an embedded repeating sRGB noise texture with CPU-generated mipmaps, and ambient plus directional diffuse lighting. Vertex colors tint the texture. Interactive visual quality is still unverified; gameplay is future work.
 
 ## Requirements
 

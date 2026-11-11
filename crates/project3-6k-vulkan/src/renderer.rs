@@ -13,6 +13,8 @@ use validation::ValidationState;
 pub use validation::{ValidationMonitor, ValidationReport};
 #[path = "depth_buffer.rs"]
 mod depth_buffer;
+#[path = "forest_mesh.rs"]
+mod forest_mesh;
 #[path = "forest_scene.rs"]
 mod forest_scene;
 
@@ -51,6 +53,8 @@ pub enum VulkanRendererError {
     Scene(#[from] project3_6k_core::SceneError),
     #[error("the renderer could not resolve a texture immediately after loading it")]
     MissingTextureAsset,
+    #[error("static forest geometry exceeds the 16-bit indexed mesh limit")]
+    MeshTooLarge,
     #[error("Vulkan validation was requested but {0} is unavailable")]
     ValidationUnavailable(&'static str),
     #[error("the embedded GLSL shader could not be decoded: {0}")]
