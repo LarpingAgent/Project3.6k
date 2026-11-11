@@ -10,7 +10,9 @@ fn main() {
     let options = match parse_args(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(error) => {
-            eprintln!("{error}\nUsage: project3-6k [--run-frames N | --auto-close]");
+            eprintln!(
+                "{error}\nUsage: project3-6k [--run-frames N [--resize-stress]] [--auto-close] [--validation]"
+            );
             std::process::exit(2);
         }
     };
@@ -26,6 +28,8 @@ fn parse_args(
 ) -> Result<project3_6k_platform::RunOptions, String> {
     let mut run_frames = None;
     let mut auto_close = false;
+    let mut validation = false;
+    let mut resize_stress = false;
     let mut args = args.into_iter();
 
     while let Some(argument) = args.next() {
@@ -51,6 +55,18 @@ fn parse_args(
                 }
                 auto_close = true;
             }
+            "--validation" => {
+                if validation {
+                    return Err("--validation may only be specified once".into());
+                }
+                validation = true;
+            }
+            "--resize-stress" => {
+                if resize_stress {
+                    return Err("--resize-stress may only be specified once".into());
+                }
+                resize_stress = true;
+            }
             unknown => return Err(format!("unrecognized argument: {unknown}")),
         }
     }
@@ -58,10 +74,15 @@ fn parse_args(
     if auto_close && run_frames.is_some() {
         return Err("--auto-close and --run-frames cannot be combined".into());
     }
+    if resize_stress && run_frames.is_none() {
+        return Err("--resize-stress requires --run-frames N".into());
+    }
 
     Ok(project3_6k_platform::RunOptions {
         run_frames,
         auto_close,
+        validation,
+        resize_stress,
     })
 }
 
@@ -81,6 +102,8 @@ mod tests {
             Ok(RunOptions {
                 run_frames: Some(60),
                 auto_close: false,
+                validation: false,
+                resize_stress: false,
             })
         );
     }
@@ -92,6 +115,8 @@ mod tests {
             Ok(RunOptions {
                 run_frames: None,
                 auto_close: true,
+                validation: false,
+                resize_stress: false,
             })
         );
     }
@@ -107,5 +132,29 @@ mod tests {
     #[test]
     fn rejects_conflicting_auto_close_and_frame_count() {
         assert!(parse_args(arguments(&["--auto-close", "--run-frames", "1"])).is_err());
+    }
+
+    #[test]
+    fn parses_validation_and_resize_stress_options() {
+        assert_eq!(
+            parse_args(arguments(&[
+                "--run-frames",
+                "180",
+                "--validation",
+                "--resize-stress",
+            ])),
+            Ok(RunOptions {
+                run_frames: Some(180),
+                auto_close: false,
+                validation: true,
+                resize_stress: true,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_resize_stress_without_frame_limit_and_duplicate_validation() {
+        assert!(parse_args(arguments(&["--resize-stress"])).is_err());
+        assert!(parse_args(arguments(&["--validation", "--validation"])).is_err());
     }
 }

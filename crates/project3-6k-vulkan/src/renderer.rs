@@ -6,6 +6,12 @@ use thiserror::Error;
 use tracing::{info, warn};
 use winit::window::Window;
 
+#[path = "validation.rs"]
+mod validation;
+
+use validation::ValidationState;
+pub use validation::{ValidationMonitor, ValidationReport};
+
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 const DEBUG_UTILS_EXTENSION: &CStr = c"VK_EXT_debug_utils";
 const SWAPCHAIN_EXTENSION: &CStr = c"VK_KHR_swapchain";
@@ -28,6 +34,8 @@ pub enum VulkanRendererError {
     NoPresentModes,
     #[error("the presentation surface does not support color-attachment images")]
     UnsupportedSurfaceUsage,
+    #[error("Vulkan validation was requested but {0} is unavailable")]
+    ValidationUnavailable(&'static str),
 }
 
 type Result<T> = std::result::Result<T, VulkanRendererError>;
@@ -47,10 +55,12 @@ struct VulkanContext {
     present_queue: vk::Queue,
     queue_family_index: u32,
     physical_device: vk::PhysicalDevice,
+    validation_enabled: bool,
+    validation_state: std::sync::Arc<ValidationState>,
 }
 
 impl VulkanContext {
-    fn new(window: &Window) -> Result<Self> {
+    fn new(window: &Window, force_validation: bool) -> Result<Self> {
         // SAFETY: Loading the system Vulkan loader is required before making Vulkan calls.
         // `Entry` owns the loaded function pointers and remains alive for this context.
         let entry = unsafe { Entry::load()? };
@@ -73,11 +83,18 @@ impl VulkanContext {
             // SAFETY: Vulkan guarantees that `extension_name` is null-terminated.
             unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) == DEBUG_UTILS_EXTENSION }
         });
-        let validation_enabled =
-            cfg!(debug_assertions) && validation_layer_available && debug_utils_available;
-        if cfg!(debug_assertions) && !validation_enabled {
-            info!("Vulkan validation layer unavailable; continuing without validation");
+        let validation_enabled = cfg!(debug_assertions) || force_validation;
+        if validation_enabled && !validation_layer_available {
+            return Err(VulkanRendererError::ValidationUnavailable(
+                "VK_LAYER_KHRONOS_validation",
+            ));
         }
+        if validation_enabled && !debug_utils_available {
+            return Err(VulkanRendererError::ValidationUnavailable(
+                "VK_EXT_debug_utils",
+            ));
+        }
+        let validation_state = std::sync::Arc::new(ValidationState::default());
 
         let mut extension_names = required_extensions.to_vec();
         if validation_enabled {
@@ -95,8 +112,7 @@ impl VulkanContext {
             .api_version(vk::API_VERSION_1_0);
         let mut debug_create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
             .message_severity(
-                vk::DebugUtilsMessageSeverityFlagsEXT::INFO
-                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
                     | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
             )
             .message_type(
@@ -105,6 +121,12 @@ impl VulkanContext {
                     | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
             )
             .pfn_user_callback(Some(vulkan_debug_callback));
+        if validation_enabled {
+            // SAFETY: `validation_state` is stored in the context before the messenger is
+            // created and remains alive until after the messenger is destroyed.
+            debug_create_info = debug_create_info
+                .user_data(std::sync::Arc::as_ptr(&validation_state) as *mut std::ffi::c_void);
+        }
         let mut instance_info = vk::InstanceCreateInfo::default()
             .application_info(&application_info)
             .enabled_extension_names(&extension_names)
@@ -148,6 +170,8 @@ impl VulkanContext {
             present_queue: vk::Queue::null(),
             queue_family_index: 0,
             physical_device: vk::PhysicalDevice::null(),
+            validation_enabled,
+            validation_state,
         };
 
         if validation_enabled {
@@ -158,21 +182,6 @@ impl VulkanContext {
             context.debug_messenger =
                 unsafe { debug_utils.create_debug_utils_messenger(&debug_create_info, None)? };
             context.debug_utils = Some(debug_utils);
-            let callback_probe = vk::DebugUtilsMessengerCallbackDataEXT::default()
-                .message(c"Project3.6k validation callback self-test");
-            // SAFETY: The debug-utils extension and messenger are live, the callback data
-            // and its static C string remain valid for the call, and submission is synchronous.
-            unsafe {
-                context
-                    .debug_utils
-                    .as_ref()
-                    .expect("debug-utils loader was just installed")
-                    .submit_debug_utils_message(
-                        vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
-                        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL,
-                        &callback_probe,
-                    );
-            }
         }
 
         let (physical_device, queue_family_index) = context.select_physical_device()?;
@@ -672,7 +681,12 @@ pub struct VulkanRenderer {
 impl VulkanRenderer {
     /// Creates the Vulkan instance, chooses a graphics/present device, and creates a swapchain.
     pub fn new(window: &Window) -> Result<Self> {
-        let context = VulkanContext::new(window)?;
+        Self::new_with_validation(window, false)
+    }
+
+    /// Creates the renderer and can require validation layers in release builds.
+    pub fn new_with_validation(window: &Window, force_validation: bool) -> Result<Self> {
+        let context = VulkanContext::new(window, force_validation)?;
         let swapchain = SwapchainState::new(&context, window)?;
         Ok(Self {
             swapchain,
@@ -680,6 +694,13 @@ impl VulkanRenderer {
             resized: false,
             suspended: false,
         })
+    }
+
+    /// Returns a monitor that remains readable after the renderer has been dropped.
+    pub fn validation_monitor(&self) -> Option<ValidationMonitor> {
+        self.context
+            .validation_enabled
+            .then(|| self.context.validation_state.monitor())
     }
 
     /// Marks the swapchain for recreation after a native window resize.
@@ -841,7 +862,7 @@ unsafe extern "system" fn vulkan_debug_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     _message_type: vk::DebugUtilsMessageTypeFlagsEXT,
     callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
-    _user_data: *mut std::ffi::c_void,
+    user_data: *mut std::ffi::c_void,
 ) -> vk::Bool32 {
     let message = if callback_data.is_null() {
         "<empty Vulkan validation message>".into()
@@ -857,12 +878,21 @@ unsafe extern "system" fn vulkan_debug_callback(
                 .into_owned()
         }
     };
+    if !user_data.is_null() {
+        // SAFETY: The callback's user pointer references the `ValidationState` Arc allocation
+        // retained by `VulkanContext` until after its debug messenger has been destroyed.
+        let state = unsafe { &*user_data.cast::<ValidationState>() };
+        if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+            state.record_warning(message.clone());
+        }
+        if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+            state.record_error(message.clone());
+        }
+    }
     if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
         tracing::error!(target: "vulkan::validation", "{message}");
     } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
         warn!(target: "vulkan::validation", "{message}");
-    } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::INFO) {
-        info!(target: "vulkan::validation", "{message}");
     }
     vk::FALSE
 }

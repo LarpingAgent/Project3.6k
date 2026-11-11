@@ -14,7 +14,7 @@ flowchart TD
     Platform --> Window[Native window]
     Vulkan --> Surface[Window surface]
     Vulkan --> GPU[Graphics and presentation queue]
-    GPU --> Swapchain[Acquire → clear pass → submit → present]
+    GPU --> Swapchain[Acquire → render pass → submit → present]
 ```
 
 ## Crate responsibilities and dependencies
@@ -31,15 +31,15 @@ The dependency graph is one-way: app → platform → core and Vulkan. There are
 1. The platform event loop receives window and keyboard events.
 2. `about_to_wait` requests a redraw and waits until the next target frame interval.
 3. The Vulkan renderer waits for the current frame fence and acquires a swapchain image.
-4. It records a clear render pass for that image, submits work waiting on image acquisition, then presents after the image-specific render semaphore signals.
+4. It records the current render pass for that image, submits work waiting on image acquisition, then presents after the image-specific render semaphore signals.
 5. Resize and out-of-date events wait for device idle and rebuild swapchain-owned resources.
-6. `--run-frames N` exits after N successful queue submissions; `--auto-close` exits after Vulkan initialization. Both use the same event-loop and RAII shutdown path as a window close.
+6. `--run-frames N` exits after N successful queue submissions; `--auto-close` exits after Vulkan initialization. `--resize-stress` exercises size changes and minimized-window suspension. All use the same event-loop and RAII shutdown path as a window close.
 
 ## Error handling
 
-Initialization and frame errors use typed `thiserror` enums and are logged at the application boundary. Vulkan failures are surfaced and terminate the app cleanly; they are not silently converted into a no-op. Validation warnings and errors use the `tracing` subscriber when the Vulkan validation layer is installed.
+Initialization and frame errors use typed `thiserror` enums and are logged at the application boundary. Vulkan failures are surfaced and terminate the app cleanly; they are not silently converted into a no-op. Debug builds require the Vulkan validation layer. The callback counts and logs every warning and error; the app returns a nonzero exit code if either count is nonzero.
 
-The app logs `application shutdown complete` after dropping the renderer and then the native window. Automated frame counts include only successful queue submissions, not redraws skipped because the swapchain is suspended or out of date.
+The app logs `application shutdown complete` after dropping the renderer and then the native window. Validation messages are checked after that teardown so shutdown-time issues also fail the process. Automated frame counts include only successful queue submissions, not redraws skipped because the swapchain is suspended or out of date.
 
 ## Future networking
 
@@ -47,4 +47,4 @@ Gameplay state should remain separate from rendering and native input. Future ne
 
 ## Current limits
 
-The first renderer submits a clear-only frame. It has no shader or pipeline manager, GPU allocator, depth buffer, texture path, scene graph, or profiling overlay. The selected Vulkan API level is 1.0; optional modern rendering features can be evaluated when a real pipeline is introduced.
+The Phase 2 renderer submits a clear-only frame and has no depth buffer, texture path, scene graph, or profiling overlay. The selected Vulkan API level is 1.0; optional modern rendering features can be evaluated when their requirements are concrete.

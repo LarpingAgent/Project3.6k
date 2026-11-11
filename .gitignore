@@ -1,3 +1,10 @@
 /target/
 *.user
 *.suo
+*.spv
+.vs/
+.vscode/
+.idea/
+.env
+.env.*
+!.env.example

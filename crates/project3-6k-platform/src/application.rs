@@ -27,6 +27,15 @@ pub enum ApplicationError {
     Window(#[from] OsError),
     #[error("could not initialize the renderer: {0}")]
     Renderer(#[from] VulkanRendererError),
+    #[error("Vulkan validation reported {warnings} warning(s) and {errors} error(s)")]
+    ValidationMessages { warnings: usize, errors: usize },
+    #[error(
+        "resize stress did not exercise the expected extents (resize events: {resize_events}, zero-extent events: {zero_extent_events})"
+    )]
+    ResizeStressIncomplete {
+        resize_events: u64,
+        zero_extent_events: u64,
+    },
 }
 
 /// Controls automatic exit for repeatable renderer lifecycle checks.
@@ -36,6 +45,10 @@ pub struct RunOptions {
     pub run_frames: Option<u64>,
     /// Exit after the window and renderer have initialized.
     pub auto_close: bool,
+    /// Require validation even in release builds. Debug builds always require it.
+    pub validation: bool,
+    /// Programmatically resize, minimize, and restore the window during the run.
+    pub resize_stress: bool,
 }
 
 /// Starts the Project3.6k application and runs its native event loop.
@@ -52,8 +65,35 @@ pub fn run_with_options(options: RunOptions) -> Result<(), ApplicationError> {
     let mut application = EngineApplication::default();
     application.options = options;
     event_loop.run_app(&mut application)?;
-    if let Some(error) = application.failure.take() {
+    let failure = application.failure.take();
+    let validation_monitor = application
+        .renderer
+        .as_ref()
+        .and_then(VulkanRenderer::validation_monitor);
+    let resize_events = application.resize_events;
+    let zero_extent_events = application.zero_extent_events;
+    drop(application);
+
+    if let Some(error) = failure {
         return Err(error);
+    }
+    if let Some(report) = validation_monitor.map(|monitor| monitor.report()) {
+        if report.has_issues() {
+            return Err(ApplicationError::ValidationMessages {
+                warnings: report.warnings,
+                errors: report.errors,
+            });
+        }
+        info!(warnings = 0, errors = 0, "Vulkan validation clean");
+    }
+    if options.resize_stress && (resize_events < 3 || zero_extent_events == 0) {
+        return Err(ApplicationError::ResizeStressIncomplete {
+            resize_events,
+            zero_extent_events,
+        });
+    }
+    if options.resize_stress {
+        info!(resize_events, zero_extent_events, "resize stress completed");
     }
     Ok(())
 }
@@ -67,6 +107,10 @@ struct EngineApplication {
     clock: Option<FrameClock>,
     failure: Option<ApplicationError>,
     frames_rendered: u64,
+    resize_events: u64,
+    zero_extent_events: u64,
+    resize_stress_started: Option<Instant>,
+    resize_stress_stage: u8,
 }
 
 impl ApplicationHandler for EngineApplication {
@@ -89,7 +133,7 @@ impl ApplicationHandler for EngineApplication {
         };
         info!("native window created");
 
-        match VulkanRenderer::new(&window) {
+        match VulkanRenderer::new_with_validation(&window, self.options.validation) {
             Ok(renderer) => {
                 self.clock = Some(FrameClock::default());
                 self.renderer = Some(renderer);
@@ -121,6 +165,15 @@ impl ApplicationHandler for EngineApplication {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
+                self.resize_events = self.resize_events.saturating_add(1);
+                if size.width == 0 || size.height == 0 {
+                    self.zero_extent_events = self.zero_extent_events.saturating_add(1);
+                    info!(
+                        width = size.width,
+                        height = size.height,
+                        "window entered zero extent"
+                    );
+                }
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
                 }
@@ -143,6 +196,7 @@ impl ApplicationHandler for EngineApplication {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.advance_resize_stress();
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
             event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -153,6 +207,47 @@ impl ApplicationHandler for EngineApplication {
 }
 
 impl EngineApplication {
+    fn advance_resize_stress(&mut self) {
+        if !self.options.resize_stress || self.resize_stress_stage >= 4 {
+            return;
+        }
+        let started = *self.resize_stress_started.get_or_insert_with(Instant::now);
+        let deadlines = [
+            Duration::from_millis(250),
+            Duration::from_millis(500),
+            Duration::from_millis(750),
+            Duration::from_millis(1_050),
+        ];
+        let stage = self.resize_stress_stage as usize;
+        if started.elapsed() < deadlines[stage] {
+            return;
+        }
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        match stage {
+            0 => {
+                let _ = window.request_inner_size(PhysicalSize::new(1024, 640));
+                info!(width = 1024, height = 640, "resize stress requested size");
+            }
+            1 => {
+                let _ = window.request_inner_size(PhysicalSize::new(720, 480));
+                info!(width = 720, height = 480, "resize stress requested size");
+            }
+            2 => {
+                window.set_minimized(true);
+                info!("resize stress minimized window");
+            }
+            3 => {
+                window.set_minimized(false);
+                let _ = window.request_inner_size(PhysicalSize::new(1280, 720));
+                info!("resize stress restored window");
+            }
+            _ => unreachable!(),
+        }
+        self.resize_stress_stage += 1;
+    }
+
     fn render_frame(&mut self, event_loop: &ActiveEventLoop) {
         let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
             return;

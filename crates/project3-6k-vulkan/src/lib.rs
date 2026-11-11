@@ -2,4 +2,4 @@
 
 mod renderer;
 
-pub use renderer::{VulkanRenderer, VulkanRendererError};
+pub use renderer::{ValidationMonitor, ValidationReport, VulkanRenderer, VulkanRendererError};

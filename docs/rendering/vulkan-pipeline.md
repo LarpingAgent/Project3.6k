@@ -4,7 +4,7 @@
 
 1. Dynamically load the system Vulkan loader through `ash`.
 2. Query the instance extensions required by the active `winit` display.
-3. Enable `VK_LAYER_KHRONOS_validation` and `VK_EXT_debug_utils` in debug builds only when both are installed.
+3. Require `VK_LAYER_KHRONOS_validation` and `VK_EXT_debug_utils` in debug builds; `--validation` can require them in release builds.
 4. Create a Vulkan 1.0 instance and native window surface.
 5. Select a device with `VK_KHR_swapchain` and one queue family that supports graphics and presentation. Prefer discrete, then integrated GPUs.
 6. Create the logical device, swapchain, image views, color-only render pass, framebuffers, command pool, command buffers, fences, and semaphores.
@@ -31,9 +31,11 @@ There are two CPU frames in flight. Per-image fences prevent a swapchain image f
 
 ## Resize and teardown
 
-Zero-sized windows suspend drawing. A nonzero resize, out-of-date acquisition, or suboptimal presentation triggers a device-idle wait, destruction of swapchain-dependent resources, and recreation. Framebuffers are destroyed before the render pass, and image views before the swapchain. The renderer is dropped before its native window.
+Zero-sized windows suspend drawing. A nonzero resize, out-of-date acquisition, or suboptimal presentation triggers a device-idle wait, destruction of swapchain-dependent resources, and recreation. Framebuffers are destroyed before the render pass, and image views before the swapchain. The renderer is dropped before its native window. `--resize-stress` requests two sizes, minimizes, and restores the window; the run fails unless it observes resize events including a zero extent.
 
-For repeatable lifecycle checks, the app accepts `--run-frames N` (positive N; exits after N successful submissions) and `--auto-close` (exits immediately after renderer initialization). Both go through the normal event-loop exit and shutdown code. Shutdown logs the submitted frame count after renderer and window destruction.
+For repeatable lifecycle checks, the app accepts `--run-frames N` (positive N; exits after N successful submissions), `--auto-close` (exits immediately after renderer initialization), and `--validation` (requires validation layers). All options go through the normal event-loop exit and shutdown code. Debug builds always enable validation. The callback counts and logs every warning/error; after renderer and window destruction the app exits nonzero if any occurred. Shutdown logs the submitted frame count.
+
+Run `scripts/validation-smoke.ps1` to execute the 1, 60, and 600 frame runs and a resize-stress run. Logs go under `target/validation-runs/`. Offscreen image readback is deferred until the renderer has geometry; the Phase 2 clear-only path has no non-clear pixels to assert.
 
 ## Next rendering steps
 
