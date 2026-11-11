@@ -15,8 +15,6 @@ pub use validation::{ValidationMonitor, ValidationReport};
 mod depth_buffer;
 #[path = "forest_scene.rs"]
 mod forest_scene;
-#[path = "texture.rs"]
-mod texture;
 
 use depth_buffer::{DepthAttachment, choose_depth_format};
 use forest_scene::ForestScene;
@@ -47,10 +45,10 @@ pub enum VulkanRendererError {
     NoSupportedDepthFormat,
     #[error("the selected Vulkan device has no linearly-filterable sRGB texture format")]
     NoSupportedTextureFormat,
-    #[error("could not decode the bundled PNG texture: {0}")]
-    TextureDecode(#[source] png::DecodingError),
-    #[error("the bundled texture is invalid: {0}")]
-    InvalidTexture(&'static str),
+    #[error("could not load a renderer texture asset: {0}")]
+    Asset(#[from] project3_6k_assets::AssetError),
+    #[error("the renderer could not resolve a texture immediately after loading it")]
+    MissingTextureAsset,
     #[error("Vulkan validation was requested but {0} is unavailable")]
     ValidationUnavailable(&'static str),
     #[error("the embedded GLSL shader could not be decoded: {0}")]
@@ -470,8 +468,7 @@ impl SwapchainState {
                 .instance
                 .get_physical_device_memory_properties(context.physical_device)
         };
-        let texture_format =
-            texture::choose_texture_format(&context.instance, context.physical_device)?;
+        let texture_format = choose_texture_format(&context.instance, context.physical_device)?;
         for _ in &self.images {
             self.depth_images.push(DepthAttachment::new(
                 &self.device,
@@ -803,6 +800,23 @@ impl VulkanRenderer {
             self.resized = !self.swapchain.recreate(&self.context, window)?;
         }
         Ok(outcome.submitted)
+    }
+}
+
+fn choose_texture_format(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<vk::Format> {
+    let format = vk::Format::R8G8B8A8_SRGB;
+    // SAFETY: The physical device belongs to the live instance.
+    let properties =
+        unsafe { instance.get_physical_device_format_properties(physical_device, format) };
+    let required =
+        vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+    if properties.optimal_tiling_features.contains(required) {
+        Ok(format)
+    } else {
+        Err(VulkanRendererError::NoSupportedTextureFormat)
     }
 }
 

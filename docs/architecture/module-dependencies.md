@@ -4,19 +4,22 @@
 
 | Crate | Depends on | Public responsibility |
 |---|---|---|
-| `project3-6k-core` | `glam` | `FrameClock`, `FrameTime`, and first-person camera math |
-| `project3-6k-vulkan` | `ash`, `ash-window`, `png`, `raw-window-handle`, `winit`, `thiserror`, `tracing` | `VulkanRenderer` initialization, color/depth attachments, embedded PNG texture upload, resize, and draw API |
+| `project3-6k-assets` | `png`, `thiserror` | Bounded PNG decoding, texture mip generation, and CPU asset cache |
+| `project3-6k-core` | `glam` | `FrameClock`, `FrameTime`, camera math, scene nodes, and transforms |
+| `project3-6k-vulkan` | `ash`, `ash-window`, `project3-6k-assets`, `raw-window-handle`, `winit`, `thiserror`, `tracing` | `VulkanRenderer` initialization, color/depth attachments, texture upload, resize, and draw API |
 | `project3-6k-platform` | core, Vulkan, `winit`, `thiserror`, `tracing` | `run()`, keyboard/mouse `InputState`, and window controls |
 | `project3-6k-app` | platform, `tracing`, `tracing-subscriber` | executable entry point |
 
 ```mermaid
 flowchart BT
   core[project3-6k-core]
+  assets[project3-6k-assets]
   vulkan[project3-6k-vulkan]
   platform[project3-6k-platform]
   app[project3-6k-app]
   platform --> core
   platform --> vulkan
+  vulkan --> assets
   app --> platform
 ```
 
@@ -24,4 +27,4 @@ The platform crate coordinates core timing and Vulkan. Core does not know about 
 
 ## Crates intentionally deferred
 
-There are no empty crates for assets, scene, world, physics, audio, or debug UI. Each should be added when its first concrete responsibility and public interface are ready. This keeps the initial build small and avoids coupling future modules to premature abstractions.
+There are no empty crates for scene, world, physics, audio, or debug UI. Assets now has a concrete CPU texture-loading and bounded-cache responsibility. Other crates should be added when their first concrete public interface is ready.

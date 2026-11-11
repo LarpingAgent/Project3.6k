@@ -2,11 +2,12 @@ use std::{io::Cursor, mem::size_of, ptr};
 
 use ash::vk;
 
-use super::texture::{DecodedTexture, FOREST_TEXTURE_PNG, decode_png, generate_mip_chain};
 use super::{Result, VulkanRendererError};
+use project3_6k_assets::{AssetManager, TextureAsset};
 
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.vert.spv"));
 const FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.frag.spv"));
+const FOREST_TEXTURE_PNG: &[u8] = include_bytes!("../../../assets/forest_noise.png");
 const FOREST_PLANE_SCALE: [f32; 2] = [2.2581, 1.2702];
 
 #[repr(C)]
@@ -326,13 +327,18 @@ impl ForestScene {
             }
         };
 
+        let mut assets = AssetManager::default();
+        let texture_handle = assets.load_png("forest/noise", FOREST_TEXTURE_PNG)?;
+        let texture_asset = assets
+            .texture(texture_handle)
+            .ok_or(VulkanRendererError::MissingTextureAsset)?;
         scene.texture = Some(TextureResource::new(
             device,
             memory_properties,
             graphics_queue,
             queue_family_index,
             texture_format,
-            decode_png(FOREST_TEXTURE_PNG)?,
+            texture_asset,
         )?);
 
         for _ in 0..super::FRAMES_IN_FLIGHT {
@@ -898,13 +904,12 @@ impl TextureResource {
         queue: vk::Queue,
         queue_family_index: u32,
         format: vk::Format,
-        decoded: DecodedTexture,
+        decoded: &TextureAsset,
     ) -> Result<Self> {
-        let mip_chain = generate_mip_chain(&decoded);
-        let mip_levels = mip_chain.len() as u32;
+        let mip_levels = decoded.mip_levels.len() as u32;
         let mut staging_data = Vec::new();
-        let mut copy_regions = Vec::with_capacity(mip_chain.len());
-        for (mip_level, level) in mip_chain.iter().enumerate() {
+        let mut copy_regions = Vec::with_capacity(decoded.mip_levels.len());
+        for (mip_level, level) in decoded.mip_levels.iter().enumerate() {
             let buffer_offset = staging_data.len() as u64;
             staging_data.extend_from_slice(&level.rgba8);
             copy_regions.push(

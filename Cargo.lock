@@ -959,6 +959,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "project3-6k-assets"
+version = "0.1.0"
+dependencies = [
+ "png",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "project3-6k-core"
 version = "0.1.0"
 dependencies = [
@@ -982,7 +990,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
- "png",
+ "project3-6k-assets",
  "raw-window-handle",
  "thiserror 2.0.21",
  "tracing",
