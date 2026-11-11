@@ -26,7 +26,11 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 - **NOT VERIFIED BY AUTOMATION** — Confirm the forest's repeating noise texture is visibly sampled and vertex colors tint it without unexpected color shifts, missing faces, or obvious seams.
 - **NOT VERIFIED BY AUTOMATION** — Move and rotate the camera across near/far geometry and resize repeatedly; confirm texture filtering changes smoothly with distance and texture sampling remains stable after swapchain recreation.
 
-## Future renderer milestones
+## Phase 3f basic lighting
 
-- Add checks for basic lighting and shading when that feature exists.
+- **NOT VERIFIED BY AUTOMATION** — Confirm canopy facets show the expected light-to-dark variation, trunks and ground remain visible under the ambient floor, and lighting stays fixed in world space while the camera turns.
+- **NOT VERIFIED BY AUTOMATION** — Move around the scene and resize the window; confirm normals do not produce abrupt shading seams or black faces.
+
+## Future manual checks
+
 - Add checks for the final forest demo's visual quality and behavior on a second Vulkan-capable GPU when one is available.

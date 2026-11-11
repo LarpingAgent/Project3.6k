@@ -22,6 +22,7 @@ struct ForestGpuVertex {
     position: [f32; 3],
     color: [f32; 3],
     uv: [f32; 2],
+    normal: [f32; 3],
 }
 
 const VERTICES: [ForestVertex; 31] = [
@@ -259,6 +260,12 @@ impl ForestScene {
                 format: vk::Format::R32G32_SFLOAT,
                 offset: (size_of::<[f32; 3]>() * 2) as u32,
             },
+            vk::VertexInputAttributeDescription {
+                location: 3,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: (size_of::<[f32; 3]>() * 2 + size_of::<[f32; 2]>()) as u32,
+            },
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&bindings)
@@ -403,6 +410,7 @@ impl ForestScene {
                     (vertex.position[0] + 1.0) * 4.0,
                     (1.0 - vertex.position[1]) * 4.0,
                 ],
+                normal: forest_vertex_normal(index),
             })
             .collect::<Vec<_>>();
         let vertex_data = gpu_vertex_bytes(&gpu_vertices);
@@ -830,7 +838,7 @@ impl Drop for BufferAllocation {
 }
 
 fn gpu_vertex_bytes(values: &[ForestGpuVertex]) -> &[u8] {
-    // SAFETY: `ForestGpuVertex` is repr(C) and consists of eight initialized f32 values, so it
+    // SAFETY: `ForestGpuVertex` is repr(C) and consists of eleven initialized f32 values, so it
     // has no padding bytes. The returned slice is bounded by the source allocation.
     unsafe {
         std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
@@ -844,6 +852,20 @@ fn mesh_vertex_depth(index: usize) -> f32 {
         10..=16 => 0.1,
         17..=23 => 0.25,
         24..=30 => 0.1,
+        _ => unreachable!("mesh vertex index validated by the static vertex table"),
+    }
+}
+
+fn forest_vertex_normal(index: usize) -> [f32; 3] {
+    match index {
+        0..=3 => [0.0, 0.2, 0.98],
+        4..=9 => [0.0, 0.0, 1.0],
+        10..=12 => [-0.36, 0.3, 0.88],
+        13..=16 => [0.0, 0.0, 1.0],
+        17..=19 => [0.0, 0.39, 0.92],
+        20..=23 => [0.0, 0.0, 1.0],
+        24..=26 => [0.36, 0.3, 0.88],
+        27..=30 => [0.0, 0.0, 1.0],
         _ => unreachable!("mesh vertex index validated by the static vertex table"),
     }
 }
@@ -1115,8 +1137,8 @@ impl Drop for TextureResource {
 #[cfg(test)]
 mod tests {
     use super::{
-        INDICES, MESH_DRAW_RANGES, VERTICES, VulkanRendererError, align_up_4, mesh_vertex_depth,
-        select_memory_type,
+        INDICES, MESH_DRAW_RANGES, VERTICES, VulkanRendererError, align_up_4, forest_vertex_normal,
+        mesh_vertex_depth, select_memory_type,
     };
     use ash::vk;
 
@@ -1149,6 +1171,26 @@ mod tests {
     fn far_ridge_is_drawn_after_nearer_tree_meshes() {
         assert_eq!(MESH_DRAW_RANGES.last(), Some(&(6, 6)));
         assert!(mesh_vertex_depth(4) < mesh_vertex_depth(17));
+    }
+
+    #[test]
+    fn forest_surfaces_have_finite_stylized_normals_for_directional_lighting() {
+        let normals = (0..VERTICES.len())
+            .map(forest_vertex_normal)
+            .collect::<Vec<_>>();
+        assert!(normals.iter().all(|normal| {
+            normal.iter().all(|component| component.is_finite())
+                && (normal
+                    .iter()
+                    .map(|component| component * component)
+                    .sum::<f32>()
+                    .sqrt()
+                    - 1.0)
+                    .abs()
+                    < 0.01
+        }));
+        assert!(forest_vertex_normal(10)[0] < 0.0);
+        assert!(forest_vertex_normal(24)[0] > 0.0);
     }
 
     #[test]
