@@ -1,28 +1,91 @@
-use std::{io::Cursor, mem::size_of, ptr};
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    mem::{offset_of, size_of},
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use ash::vk;
+use glam::{Mat4, Quat, Vec3};
+use project3_6k_assets::{
+    AlphaMode, AsyncModelLoader, CpuMaterialAsset, ModelImportLimits, TextureAsset, TextureBinding,
+    TextureMipMode, import_image,
+};
+use tracing::info;
 
-use super::forest_mesh::{ForestGpuVertex, build_forest_geometry, index_bytes, vertex_bytes};
-use super::{Result, VulkanRendererError};
-use project3_6k_assets::{AssetManager, TextureAsset};
-use project3_6k_core::Scene;
+use super::{
+    FRAMES_IN_FLIGHT, Result, VulkanRendererError,
+    forest_mesh::build_forest_geometry,
+    gpu_asset_cache::{
+        GpuAssetCache, GpuDrawRange, GpuMaterial, GpuModelAsset, GpuModelHandle, GpuVertex,
+        upload_gpu_mesh,
+    },
+    gpu_resources::{BufferAllocation, TextureResource},
+};
 
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.vert.spv"));
 const FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.frag.spv"));
-const FOREST_TEXTURE_PNG: &[u8] = include_bytes!("../../../assets/forest_noise.png");
+const MATERIAL_TEXTURE_COUNT: usize = 5;
+const PUSH_CONSTANT_BYTES: u32 = 128;
+const MODEL_IDS: [&str; 4] = ["tree_stump_01", "rock_09", "dead_tree_trunk_02", "shrub_03"];
+const SUN_DIRECTION: Vec3 = Vec3::new(-0.43, 0.82, 0.38);
+
+#[repr(C, align(16))]
+struct SceneUniform {
+    view_projection: [[f32; 4]; 4],
+    camera_position: [f32; 4],
+    sun_direction: [f32; 4],
+    sun_color: [f32; 4],
+    ambient_color: [f32; 4],
+}
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct MaterialPushConstants {
+    model: [[f32; 4]; 4],
+    base_color_factor: [f32; 4],
+    material_params: [f32; 4],
+    emissive_factor: [f32; 4],
+    material_flags: [f32; 4],
+}
+
+struct PlacedModel {
+    handle: GpuModelHandle,
+    transform: Mat4,
+    material_sets: Vec<vk::DescriptorSet>,
+}
+
+struct GroundResources {
+    vertex_buffer: BufferAllocation,
+    index_buffer: BufferAllocation,
+    index_count: u32,
+    textures: Vec<TextureResource>,
+    material: GpuMaterial,
+    gpu_bytes: usize,
+}
+
+struct FallbackTextures {
+    base_color: TextureResource,
+    normal: TextureResource,
+    data: TextureResource,
+    emissive: TextureResource,
+}
+
 pub(super) struct ForestScene {
     device: ash::Device,
-    scene: Scene,
-    draw_ranges: Vec<(u32, u32)>,
     descriptor_set_layout: vk::DescriptorSetLayout,
+    material_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_sets: Vec<vk::DescriptorSet>,
+    scene_descriptor_sets: Vec<vk::DescriptorSet>,
+    ground_material_set: vk::DescriptorSet,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    texture: Option<TextureResource>,
     camera_buffers: Vec<BufferAllocation>,
-    vertex_buffer: Option<BufferAllocation>,
-    index_buffer: Option<BufferAllocation>,
+    ground: Option<GroundResources>,
+    fallbacks: Option<FallbackTextures>,
+    gpu_assets: GpuAssetCache,
+    models: Vec<PlacedModel>,
 }
 
 impl ForestScene {
@@ -32,93 +95,266 @@ impl ForestScene {
         render_pass: vk::RenderPass,
         graphics_queue: vk::Queue,
         queue_family_index: u32,
-        texture_format: vk::Format,
+        srgb_format: vk::Format,
+        linear_format: vk::Format,
     ) -> Result<Self> {
-        let geometry = build_forest_geometry()?;
+        let mut gpu_assets = GpuAssetCache::new(
+            device,
+            *memory_properties,
+            graphics_queue,
+            queue_family_index,
+            srgb_format,
+            linear_format,
+        );
+        let model_handles = load_reference_models(&mut gpu_assets)?;
         let mut scene = Self {
             device: device.clone(),
-            scene: geometry.scene,
-            draw_ranges: geometry.draw_ranges,
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            material_set_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
-            descriptor_sets: Vec::new(),
+            scene_descriptor_sets: Vec::new(),
+            ground_material_set: vk::DescriptorSet::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
-            texture: None,
             camera_buffers: Vec::new(),
-            vertex_buffer: None,
-            index_buffer: None,
+            ground: None,
+            fallbacks: None,
+            gpu_assets,
+            models: Vec::new(),
         };
 
-        let vertex_shader = ShaderModule::new(device, VERTEX_SHADER)?;
-        let fragment_shader = ShaderModule::new(device, FRAGMENT_SHADER)?;
-        let descriptor_bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::VERTEX),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-        ];
-        let descriptor_layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_bindings);
-        // SAFETY: The layout has one vertex-stage uniform binding with one descriptor.
-        scene.descriptor_set_layout =
-            unsafe { device.create_descriptor_set_layout(&descriptor_layout_info, None)? };
-        let descriptor_layouts = [scene.descriptor_set_layout];
-        let layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_layouts);
-        // SAFETY: The set layout is live and remains owned by this scene for the pipeline lifetime.
-        scene.pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
+        scene.ground = Some(load_ground(
+            device,
+            memory_properties,
+            graphics_queue,
+            queue_family_index,
+            srgb_format,
+            linear_format,
+        )?);
+        scene.fallbacks = Some(FallbackTextures::new(
+            device,
+            memory_properties,
+            graphics_queue,
+            queue_family_index,
+            srgb_format,
+            linear_format,
+        )?);
 
-        let entry_point = c"main";
+        for _ in 0..FRAMES_IN_FLIGHT {
+            scene.camera_buffers.push(BufferAllocation::new(
+                device,
+                memory_properties,
+                size_of::<SceneUniform>(),
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE,
+                vk::MemoryPropertyFlags::HOST_COHERENT,
+                "host-visible scene uniform",
+            )?);
+        }
+
+        scene.create_layouts_and_pipeline(render_pass)?;
+        scene.create_model_placements(&model_handles)?;
+        scene.create_descriptors()?;
+
+        let model_bytes = scene.gpu_assets.resident_gpu_bytes();
+        let ground_bytes = scene.ground.as_ref().map_or(0, |ground| ground.gpu_bytes);
+        info!(
+            model_count = scene.gpu_assets.model_count(),
+            placements = scene.models.len(),
+            gpu_model_bytes = model_bytes,
+            gpu_ground_bytes = ground_bytes,
+            "PBR reference scene uploaded"
+        );
+        Ok(scene)
+    }
+
+    pub(super) fn update_camera(
+        &self,
+        frame_index: usize,
+        view_projection: [[f32; 4]; 4],
+        camera_position: [f32; 3],
+    ) -> Result<()> {
+        let sun_direction = SUN_DIRECTION.normalize();
+        let uniform = SceneUniform {
+            view_projection,
+            camera_position: [
+                camera_position[0],
+                camera_position[1],
+                camera_position[2],
+                1.0,
+            ],
+            sun_direction: [sun_direction.x, sun_direction.y, sun_direction.z, 1.0],
+            sun_color: [3.2, 2.9, 2.55, 1.0],
+            ambient_color: [0.10, 0.12, 0.15, 1.0],
+        };
+        self.camera_buffers[frame_index].upload(struct_bytes(&uniform))
+    }
+
+    pub(super) fn record_draw(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        extent: vk::Extent2D,
+        frame_index: usize,
+    ) {
+        let viewport = [vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: extent.width as f32,
+            height: extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        let scissor = [vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        }];
+        let scene_set = [self.scene_descriptor_sets[frame_index]];
+        // SAFETY: All pipelines, descriptors, buffers and the render pass are live for this draw.
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline,
+            );
+            self.device.cmd_set_viewport(command_buffer, 0, &viewport);
+            self.device.cmd_set_scissor(command_buffer, 0, &scissor);
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &scene_set,
+                &[],
+            );
+        }
+
+        if let Some(ground) = &self.ground {
+            self.bind_draw_buffers(command_buffer, &ground.vertex_buffer, &ground.index_buffer);
+            let material_set = [self.ground_material_set];
+            // SAFETY: The ground descriptors, index range, pipeline layout, and material are live.
+            unsafe {
+                self.device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    1,
+                    &material_set,
+                    &[],
+                );
+                self.push_material(command_buffer, Mat4::IDENTITY, &ground.material.source);
+                self.device
+                    .cmd_draw_indexed(command_buffer, ground.index_count, 1, 0, 0, 0);
+            }
+        }
+
+        for placed in &self.models {
+            let Some(model) = self.gpu_assets.model(placed.handle) else {
+                continue;
+            };
+            self.bind_draw_buffers(command_buffer, &model.vertex_buffer, &model.index_buffer);
+            for instance in &model.instances {
+                let local_to_model = Mat4::from_cols_array_2d(&instance.transform);
+                let model_to_world = placed.transform * local_to_model;
+                for draw in &model.draws {
+                    self.draw_model_primitive(
+                        command_buffer,
+                        model,
+                        draw,
+                        model_to_world,
+                        &placed.material_sets,
+                    );
+                }
+            }
+        }
+    }
+
+    fn create_layouts_and_pipeline(&mut self, render_pass: vk::RenderPass) -> Result<()> {
+        let scene_bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
+        // SAFETY: The scene layout owns one per-frame uniform visible to both shader stages.
+        self.descriptor_set_layout = unsafe {
+            self.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&scene_bindings),
+                None,
+            )?
+        };
+        let material_bindings: [vk::DescriptorSetLayoutBinding<'_>; MATERIAL_TEXTURE_COUNT] =
+            std::array::from_fn(|binding| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(binding as u32)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            });
+        // SAFETY: Five sampled maps are independently bound to the fragment shader.
+        self.material_set_layout = unsafe {
+            self.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&material_bindings),
+                None,
+            )?
+        };
+        let layouts = [self.descriptor_set_layout, self.material_set_layout];
+        let push_constants = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(PUSH_CONSTANT_BYTES)];
+        // SAFETY: Both descriptor layouts outlive the pipeline layout; push data fits Vulkan's
+        // guaranteed 128-byte minimum range.
+        self.pipeline_layout = unsafe {
+            self.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&layouts)
+                    .push_constant_ranges(&push_constants),
+                None,
+            )?
+        };
+
+        let vertex_shader = ShaderModule::new(&self.device, VERTEX_SHADER)?;
+        let fragment_shader = ShaderModule::new(&self.device, FRAGMENT_SHADER)?;
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(vertex_shader.handle)
-                .name(entry_point),
+                .name(c"main"),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(fragment_shader.handle)
-                .name(entry_point),
+                .name(c"main"),
         ];
-        let bindings = [vk::VertexInputBindingDescription {
+        let vertex_bindings = [vk::VertexInputBindingDescription {
             binding: 0,
-            stride: size_of::<ForestGpuVertex>() as u32,
+            stride: size_of::<GpuVertex>() as u32,
             input_rate: vk::VertexInputRate::VERTEX,
         }];
-        let attributes = [
-            vk::VertexInputAttributeDescription {
-                location: 0,
-                binding: 0,
-                format: vk::Format::R32G32B32_SFLOAT,
-                offset: 0,
-            },
-            vk::VertexInputAttributeDescription {
-                location: 1,
-                binding: 0,
-                format: vk::Format::R32G32B32_SFLOAT,
-                offset: size_of::<[f32; 3]>() as u32,
-            },
-            vk::VertexInputAttributeDescription {
-                location: 2,
-                binding: 0,
-                format: vk::Format::R32G32_SFLOAT,
-                offset: (size_of::<[f32; 3]>() * 2) as u32,
-            },
-            vk::VertexInputAttributeDescription {
-                location: 3,
-                binding: 0,
-                format: vk::Format::R32G32B32_SFLOAT,
-                offset: (size_of::<[f32; 3]>() * 2 + size_of::<[f32; 2]>()) as u32,
-            },
+        let vertex_attributes = [
+            vertex_attribute(
+                0,
+                vk::Format::R32G32B32_SFLOAT,
+                offset_of!(GpuVertex, position),
+            ),
+            vertex_attribute(
+                1,
+                vk::Format::R32G32B32_SFLOAT,
+                offset_of!(GpuVertex, normal),
+            ),
+            vertex_attribute(
+                2,
+                vk::Format::R32G32B32A32_SFLOAT,
+                offset_of!(GpuVertex, tangent),
+            ),
+            vertex_attribute(3, vk::Format::R32G32_SFLOAT, offset_of!(GpuVertex, uv)),
+            vertex_attribute(
+                4,
+                vk::Format::R32G32B32A32_SFLOAT,
+                offset_of!(GpuVertex, color),
+            ),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+            .vertex_binding_descriptions(&vertex_bindings)
+            .vertex_attribute_descriptions(&vertex_attributes);
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
             .primitive_restart_enable(false);
@@ -155,225 +391,317 @@ impl ForestScene {
             .depth_stencil_state(&depth_stencil)
             .color_blend_state(&color_blending)
             .dynamic_state(&dynamic_state)
-            .layout(scene.pipeline_layout)
+            .layout(self.pipeline_layout)
             .render_pass(render_pass)
             .subpass(0)];
-        // SAFETY: Shader modules, pipeline layout, and render pass stay alive through creation;
-        // all state structures reference local arrays that outlive the call.
-        scene.pipeline = match unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+        // SAFETY: Shader modules, descriptor layouts, render pass, and referenced state are live.
+        self.pipeline = match unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
         } {
             Ok(mut pipelines) => pipelines.remove(0),
             Err((pipelines, error)) => {
-                // SAFETY: Any handles returned on a partial creation failure belong to this device.
+                // SAFETY: Any handles returned on partial pipeline failure belong to this device.
                 unsafe {
                     for pipeline in pipelines {
-                        device.destroy_pipeline(pipeline, None);
+                        self.device.destroy_pipeline(pipeline, None);
                     }
                 }
                 return Err(error.into());
             }
         };
+        Ok(())
+    }
 
-        let mut assets = AssetManager::default();
-        let texture_handle = assets.load_png("forest/noise", FOREST_TEXTURE_PNG)?;
-        let texture_asset = assets
-            .texture(texture_handle)
-            .ok_or(VulkanRendererError::MissingTextureAsset)?;
-        scene.texture = Some(TextureResource::new(
-            device,
-            memory_properties,
-            graphics_queue,
-            queue_family_index,
-            texture_format,
-            texture_asset,
-        )?);
+    fn create_model_placements(&mut self, handles: &HashMap<String, GpuModelHandle>) -> Result<()> {
+        let stump = *handles
+            .get("tree_stump_01")
+            .ok_or(VulkanRendererError::InvalidGpuAssetMaterial)?;
+        let rock = *handles
+            .get("rock_09")
+            .ok_or(VulkanRendererError::InvalidGpuAssetMaterial)?;
+        let trunk = *handles
+            .get("dead_tree_trunk_02")
+            .ok_or(VulkanRendererError::InvalidGpuAssetMaterial)?;
+        let shrub = *handles
+            .get("shrub_03")
+            .ok_or(VulkanRendererError::InvalidGpuAssetMaterial)?;
+        self.models = vec![
+            placed_model(
+                stump,
+                Vec3::new(0.0, 0.19, -1.2),
+                Quat::from_rotation_y(0.4),
+                Vec3::splat(1.0),
+            ),
+            placed_model(
+                rock,
+                Vec3::new(-2.1, 0.01, -2.5),
+                Quat::from_rotation_y(-0.55),
+                Vec3::splat(10.0),
+            ),
+            placed_model(
+                trunk,
+                Vec3::new(-1.7, 0.92, -3.5),
+                Quat::from_rotation_z(std::f32::consts::FRAC_PI_2) * Quat::from_rotation_y(-0.22),
+                Vec3::splat(0.45),
+            ),
+            placed_model(
+                shrub,
+                Vec3::new(1.75, 0.0, -2.7),
+                Quat::from_rotation_y(0.9),
+                Vec3::splat(4.0),
+            ),
+            placed_model(
+                shrub,
+                Vec3::new(3.05, 0.0, -4.2),
+                Quat::from_rotation_y(-0.5),
+                Vec3::splat(3.4),
+            ),
+            placed_model(
+                rock,
+                Vec3::new(2.7, 0.008, -4.6),
+                Quat::from_rotation_y(1.2),
+                Vec3::splat(7.5),
+            ),
+        ];
+        Ok(())
+    }
 
-        for _ in 0..super::FRAMES_IN_FLIGHT {
-            scene.camera_buffers.push(BufferAllocation::new(
-                device,
-                memory_properties,
-                size_of::<[[f32; 4]; 4]>(),
-                vk::BufferUsageFlags::UNIFORM_BUFFER,
-                vk::MemoryPropertyFlags::HOST_VISIBLE,
-                vk::MemoryPropertyFlags::HOST_COHERENT,
-                "host-visible camera uniform",
-            )?);
-        }
+    fn create_descriptors(&mut self) -> Result<()> {
+        let material_set_count = self.models.iter().try_fold(1usize, |sum, placed| {
+            let model = self
+                .gpu_assets
+                .model(placed.handle)
+                .ok_or(VulkanRendererError::InvalidGpuAssetMaterial)?;
+            sum.checked_add(model.materials.len())
+                .ok_or(VulkanRendererError::GpuAssetSizeOverflow)
+        })?;
+        let material_descriptor_count = material_set_count
+            .checked_mul(MATERIAL_TEXTURE_COUNT)
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or(VulkanRendererError::GpuAssetSizeOverflow)?;
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: super::FRAMES_IN_FLIGHT as u32,
+                descriptor_count: FRAMES_IN_FLIGHT as u32,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: super::FRAMES_IN_FLIGHT as u32,
+                descriptor_count: material_descriptor_count,
             },
         ];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(super::FRAMES_IN_FLIGHT as u32)
-            .pool_sizes(&pool_sizes);
-        // SAFETY: The pool capacity covers each per-frame camera uniform descriptor.
-        scene.descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
-        let set_layouts = vec![scene.descriptor_set_layout; super::FRAMES_IN_FLIGHT];
-        let allocate_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(scene.descriptor_pool)
-            .set_layouts(&set_layouts);
-        // SAFETY: The pool and every requested descriptor layout are live and compatible.
-        scene.descriptor_sets = unsafe { device.allocate_descriptor_sets(&allocate_info)? };
-        let texture = scene
-            .texture
-            .as_ref()
-            .expect("texture initialized before descriptors");
-        for (buffer, descriptor_set) in scene.camera_buffers.iter().zip(&scene.descriptor_sets) {
+        let set_count = FRAMES_IN_FLIGHT
+            .checked_add(material_set_count)
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or(VulkanRendererError::GpuAssetSizeOverflow)?;
+        // SAFETY: Pool sizes cover all scene uniforms and five sampled maps per material set.
+        self.descriptor_pool = unsafe {
+            self.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(set_count)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )?
+        };
+        let scene_layouts = vec![self.descriptor_set_layout; FRAMES_IN_FLIGHT];
+        let scene_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&scene_layouts);
+        // SAFETY: The descriptor pool and each requested scene set layout are live.
+        self.scene_descriptor_sets = unsafe { self.device.allocate_descriptor_sets(&scene_info)? };
+        for (camera_buffer, descriptor_set) in
+            self.camera_buffers.iter().zip(&self.scene_descriptor_sets)
+        {
             let buffer_info = [vk::DescriptorBufferInfo::default()
-                .buffer(buffer.buffer)
+                .buffer(camera_buffer.buffer)
                 .offset(0)
-                .range(size_of::<[[f32; 4]; 4]>() as u64)];
-            let image_info = [vk::DescriptorImageInfo::default()
-                .sampler(texture.sampler)
-                .image_view(texture.view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let writes = [
-                vk::WriteDescriptorSet::default()
-                    .dst_set(*descriptor_set)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                    .buffer_info(&buffer_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(*descriptor_set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&image_info),
-            ];
-            // SAFETY: Each set references live uniform/image resources with compatible layouts.
-            unsafe { device.update_descriptor_sets(&writes, &[]) };
+                .range(size_of::<SceneUniform>() as u64)];
+            let write = [vk::WriteDescriptorSet::default()
+                .dst_set(*descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&buffer_info)];
+            // SAFETY: This set references its own live host-visible scene uniform.
+            unsafe { self.device.update_descriptor_sets(&write, &[]) };
         }
 
-        let vertex_data = vertex_bytes(&geometry.vertices);
-        let index_data = index_bytes(&geometry.indices);
-        let vertex_size = vertex_data.len();
-        let index_offset = align_up_4(vertex_size);
-        let index_copy_size = align_up_4(index_data.len());
-        let mut staging_data = vec![0; index_offset + index_copy_size];
-        staging_data[..vertex_size].copy_from_slice(vertex_data);
-        staging_data[index_offset..index_offset + index_data.len()].copy_from_slice(index_data);
-
-        let staging = BufferAllocation::new(
-            device,
-            memory_properties,
-            staging_data.len(),
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::MemoryPropertyFlags::HOST_VISIBLE,
-            vk::MemoryPropertyFlags::HOST_COHERENT,
-            "host-visible staging",
-        )?;
-        staging.upload(&staging_data)?;
-
-        let vertex_buffer = BufferAllocation::new(
-            device,
-            memory_properties,
-            vertex_size,
-            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            "device-local vertex",
-        )?;
-        let index_buffer = BufferAllocation::new(
-            device,
-            memory_properties,
-            index_copy_size,
-            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            "device-local index",
-        )?;
-        upload_static_mesh(
-            device,
-            graphics_queue,
-            queue_family_index,
-            &staging,
-            &vertex_buffer,
-            &index_buffer,
-            MeshUploadLayout {
-                vertex_size: vertex_size as u64,
-                index_offset: index_offset as u64,
-                index_copy_size: index_copy_size as u64,
-            },
-        )?;
-        scene.vertex_buffer = Some(vertex_buffer);
-        scene.index_buffer = Some(index_buffer);
-        Ok(scene)
+        let material_layouts = vec![self.material_set_layout; material_set_count];
+        let material_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&material_layouts);
+        // SAFETY: The pool has capacity and every requested set uses the same live material layout.
+        let material_sets = unsafe { self.device.allocate_descriptor_sets(&material_info)? };
+        let fallbacks = self
+            .fallbacks
+            .as_ref()
+            .expect("fallback textures are loaded before material descriptors");
+        let ground = self
+            .ground
+            .as_ref()
+            .expect("ground material is loaded before material descriptors");
+        self.ground_material_set = material_sets[0];
+        self.update_material_descriptor(
+            self.ground_material_set,
+            &ground.material,
+            &ground.textures,
+            fallbacks,
+        );
+        let mut next_set = 1;
+        let mut sets_per_model = Vec::with_capacity(self.models.len());
+        for placed in &self.models {
+            let model = self
+                .gpu_assets
+                .model(placed.handle)
+                .ok_or(VulkanRendererError::InvalidGpuAssetMaterial)?;
+            let end = next_set + model.materials.len();
+            sets_per_model.push(material_sets[next_set..end].to_vec());
+            next_set = end;
+        }
+        for (placed, sets) in self.models.iter_mut().zip(sets_per_model) {
+            placed.material_sets = sets;
+        }
+        for placed in &self.models {
+            let model = self
+                .gpu_assets
+                .model(placed.handle)
+                .ok_or(VulkanRendererError::InvalidGpuAssetMaterial)?;
+            for (material, set) in model.materials.iter().zip(&placed.material_sets) {
+                self.update_material_descriptor(*set, material, &model.textures, fallbacks);
+            }
+        }
+        Ok(())
     }
 
-    pub(super) fn update_camera(
+    fn update_material_descriptor(
         &self,
-        frame_index: usize,
-        view_projection: [[f32; 4]; 4],
-    ) -> Result<()> {
-        self.camera_buffers[frame_index].upload(matrix_bytes(&view_projection))
+        descriptor_set: vk::DescriptorSet,
+        material: &GpuMaterial,
+        textures: &[TextureResource],
+        fallbacks: &FallbackTextures,
+    ) {
+        let image_infos = [
+            texture_info(material.base_color_texture, textures, &fallbacks.base_color),
+            texture_info(material.normal_texture, textures, &fallbacks.normal),
+            texture_info(
+                material.metallic_roughness_texture,
+                textures,
+                &fallbacks.data,
+            ),
+            texture_info(material.occlusion_texture, textures, &fallbacks.data),
+            texture_info(material.emissive_texture, textures, &fallbacks.emissive),
+        ];
+        let writes = image_infos
+            .iter()
+            .enumerate()
+            .map(|(binding, image_info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(binding as u32)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(image_info))
+            })
+            .collect::<Vec<_>>();
+        // SAFETY: Each set is updated before submission and references live shader-readable images.
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
     }
 
-    pub(super) fn record_draw(
+    fn bind_draw_buffers(
         &self,
         command_buffer: vk::CommandBuffer,
-        extent: vk::Extent2D,
-        frame_index: usize,
+        vertex_buffer: &BufferAllocation,
+        index_buffer: &BufferAllocation,
     ) {
-        let vertex_buffer = self
-            .vertex_buffer
-            .as_ref()
-            .expect("scene vertex buffer initialized");
-        let index_buffer = self
-            .index_buffer
-            .as_ref()
-            .expect("scene index buffer initialized");
-        let viewports = [vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: extent.width as f32,
-            height: extent.height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        }];
-        let scissors = [vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent,
-        }];
         let vertex_buffers = [vertex_buffer.buffer];
         let offsets = [0];
-        let descriptor_sets = [self.descriptor_sets[frame_index]];
-        // SAFETY: The command buffer is recording inside the compatible render pass. The
-        // pipeline, buffers, viewport, and index range are owned by this live scene.
+        // SAFETY: The buffers are live device-local allocations with compatible usage flags.
         unsafe {
-            self.device.cmd_bind_pipeline(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline,
-            );
-            self.device.cmd_set_viewport(command_buffer, 0, &viewports);
-            self.device.cmd_set_scissor(command_buffer, 0, &scissors);
-            self.device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                0,
-                &descriptor_sets,
-                &[],
-            );
             self.device
                 .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
             self.device.cmd_bind_index_buffer(
                 command_buffer,
                 index_buffer.buffer,
                 0,
-                vk::IndexType::UINT16,
+                vk::IndexType::UINT32,
             );
-            for node in self.scene.nodes() {
-                let (first_index, index_count) = self.draw_ranges[node.mesh().index() as usize];
-                self.device
-                    .cmd_draw_indexed(command_buffer, index_count, 1, first_index, 0, 0);
-            }
+        }
+    }
+
+    fn draw_model_primitive(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        model: &GpuModelAsset,
+        draw: &GpuDrawRange,
+        model_to_world: Mat4,
+        material_sets: &[vk::DescriptorSet],
+    ) {
+        let material = &model.materials[draw.material_index];
+        let descriptor_set = [material_sets[draw.material_index]];
+        // SAFETY: The descriptor set and push constants match this pipeline's second set/layout.
+        unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                1,
+                &descriptor_set,
+                &[],
+            );
+            self.push_material(command_buffer, model_to_world, &material.source);
+            self.device.cmd_draw_indexed(
+                command_buffer,
+                draw.index_count,
+                1,
+                draw.first_index,
+                draw.vertex_offset,
+                0,
+            );
+        }
+    }
+
+    fn push_material(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        model_to_world: Mat4,
+        material: &CpuMaterialAsset,
+    ) {
+        let alpha_mode = match material.alpha_mode {
+            AlphaMode::Opaque => 0.0,
+            AlphaMode::Mask => 1.0,
+            AlphaMode::Blend => 2.0,
+        };
+        let constants = MaterialPushConstants {
+            model: model_to_world.to_cols_array_2d(),
+            base_color_factor: material.base_color_factor,
+            material_params: [
+                material.metallic_factor,
+                material.roughness_factor,
+                material.normal_scale,
+                material.occlusion_strength,
+            ],
+            emissive_factor: [
+                material.emissive_factor[0],
+                material.emissive_factor[1],
+                material.emissive_factor[2],
+                1.0,
+            ],
+            material_flags: [
+                material.alpha_cutoff,
+                alpha_mode,
+                material.double_sided as u8 as f32,
+                0.0,
+            ],
+        };
+        // SAFETY: This fully initialized, 16-byte-aligned block is exactly the declared 128 bytes.
+        // SAFETY: This command buffer is recording inside the live render pass and the declared
+        // pipeline range is 128 bytes, matching the fully initialized push-constant block.
+        unsafe {
+            self.device.cmd_push_constants(
+                command_buffer,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                struct_bytes(&constants),
+            );
         }
     }
 }
@@ -388,19 +716,299 @@ impl Drop for ForestScene {
             if self.descriptor_pool != vk::DescriptorPool::null() {
                 self.device
                     .destroy_descriptor_pool(self.descriptor_pool, None);
-                self.descriptor_pool = vk::DescriptorPool::null();
             }
             if self.pipeline_layout != vk::PipelineLayout::null() {
                 self.device
                     .destroy_pipeline_layout(self.pipeline_layout, None);
             }
+            if self.material_set_layout != vk::DescriptorSetLayout::null() {
+                self.device
+                    .destroy_descriptor_set_layout(self.material_set_layout, None);
+            }
             if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
                 self.device
                     .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
-                self.descriptor_set_layout = vk::DescriptorSetLayout::null();
             }
         }
     }
+}
+
+impl FallbackTextures {
+    fn new(
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        queue: vk::Queue,
+        queue_family_index: u32,
+        srgb_format: vk::Format,
+        linear_format: vk::Format,
+    ) -> Result<Self> {
+        Ok(Self {
+            base_color: create_one_pixel_texture(
+                device,
+                memory_properties,
+                queue,
+                queue_family_index,
+                srgb_format,
+                [255, 255, 255, 255],
+                TextureMipMode::SrgbColor,
+            )?,
+            normal: create_one_pixel_texture(
+                device,
+                memory_properties,
+                queue,
+                queue_family_index,
+                linear_format,
+                [128, 128, 255, 255],
+                TextureMipMode::NormalMap,
+            )?,
+            data: create_one_pixel_texture(
+                device,
+                memory_properties,
+                queue,
+                queue_family_index,
+                linear_format,
+                [255, 255, 255, 255],
+                TextureMipMode::LinearData,
+            )?,
+            emissive: create_one_pixel_texture(
+                device,
+                memory_properties,
+                queue,
+                queue_family_index,
+                srgb_format,
+                [0, 0, 0, 255],
+                TextureMipMode::SrgbColor,
+            )?,
+        })
+    }
+}
+
+fn load_reference_models(
+    gpu_assets: &mut GpuAssetCache,
+) -> Result<HashMap<String, GpuModelHandle>> {
+    let asset_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/reference_scene/polyhaven");
+    let mut loader = AsyncModelLoader::new(ModelImportLimits::default(), MODEL_IDS.len())?;
+    let mut pending = HashMap::new();
+    for id in MODEL_IDS {
+        let path = asset_root.join(id).join(format!("{id}-1k.gltf"));
+        let request = loader.request(&path)?;
+        pending.insert(request, id.to_owned());
+    }
+    let cpu_started = Instant::now();
+    let mut imported = HashMap::with_capacity(MODEL_IDS.len());
+    while !pending.is_empty() {
+        let event = loader
+            .wait_next(Duration::from_secs(120))
+            .ok_or(VulkanRendererError::AssetWorkerTimeout)?;
+        let id = pending
+            .remove(&event.id)
+            .ok_or(VulkanRendererError::InvalidGpuAssetMaterial)?;
+        imported.insert(id, event.result?);
+    }
+    drop(loader);
+    info!(
+        imported_models = imported.len(),
+        cpu_import_ms = cpu_started.elapsed().as_secs_f64() * 1000.0,
+        "external forest models decoded on asset worker"
+    );
+
+    let gpu_started = Instant::now();
+    let mut handles = HashMap::with_capacity(MODEL_IDS.len());
+    for id in MODEL_IDS {
+        let model = imported
+            .remove(id)
+            .ok_or(VulkanRendererError::InvalidGpuAssetMaterial)?;
+        let handle = gpu_assets.insert(&format!("polyhaven/{id}"), model)?;
+        handles.insert(id.to_owned(), handle);
+    }
+    info!(
+        models = gpu_assets.model_count(),
+        gpu_resident_bytes = gpu_assets.resident_gpu_bytes(),
+        gpu_upload_ms = gpu_started.elapsed().as_secs_f64() * 1000.0,
+        "external forest models cached on GPU"
+    );
+    Ok(handles)
+}
+
+fn load_ground(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    queue: vk::Queue,
+    queue_family_index: u32,
+    srgb_format: vk::Format,
+    linear_format: vk::Format,
+) -> Result<GroundResources> {
+    let asset_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets/reference_scene/polyhaven/forrest_ground_03");
+    let limits = ModelImportLimits::default();
+    let diffuse = import_image(asset_root.join("forrest_ground_03_diff_1k.jpg"), limits)?;
+    let normal = import_image(asset_root.join("forrest_ground_03_nor_gl_1k.jpg"), limits)?;
+    let arm = import_image(asset_root.join("forrest_ground_03_arm_1k.jpg"), limits)?;
+    let texture_assets = [
+        (
+            srgb_format,
+            TextureAsset::from_rgba8(
+                diffuse.width,
+                diffuse.height,
+                &diffuse.rgba8,
+                TextureMipMode::SrgbColor,
+            )?,
+        ),
+        (
+            linear_format,
+            TextureAsset::from_rgba8(
+                normal.width,
+                normal.height,
+                &normal.rgba8,
+                TextureMipMode::NormalMap,
+            )?,
+        ),
+        (
+            linear_format,
+            TextureAsset::from_rgba8(
+                arm.width,
+                arm.height,
+                &arm.rgba8,
+                TextureMipMode::LinearData,
+            )?,
+        ),
+    ];
+    let gpu_bytes = texture_assets
+        .iter()
+        .try_fold(0usize, |sum, (_, texture)| {
+            sum.checked_add(texture.byte_size)
+                .ok_or(VulkanRendererError::GpuAssetSizeOverflow)
+        })?;
+    let mut textures = Vec::with_capacity(texture_assets.len());
+    for (format, texture) in &texture_assets {
+        textures.push(TextureResource::new(
+            device,
+            memory_properties,
+            queue,
+            queue_family_index,
+            *format,
+            texture,
+        )?);
+    }
+    let geometry = build_forest_geometry();
+    let (vertex_buffer, index_buffer) = upload_gpu_mesh(
+        device,
+        memory_properties,
+        queue,
+        queue_family_index,
+        &geometry.vertices,
+        &geometry.indices,
+    )?;
+    let material = GpuMaterial {
+        source: CpuMaterialAsset {
+            name: Some("Poly Haven Forest Ground 03".to_owned()),
+            base_color_factor: [1.0; 4],
+            metallic_factor: 0.0,
+            roughness_factor: 1.0,
+            emissive_factor: [0.0; 3],
+            base_color_texture: Some(TextureBinding {
+                image_index: 0,
+                tex_coord: 0,
+            }),
+            metallic_roughness_texture: Some(TextureBinding {
+                image_index: 2,
+                tex_coord: 0,
+            }),
+            normal_texture: Some(TextureBinding {
+                image_index: 1,
+                tex_coord: 0,
+            }),
+            occlusion_texture: Some(TextureBinding {
+                image_index: 2,
+                tex_coord: 0,
+            }),
+            emissive_texture: None,
+            alpha_mode: AlphaMode::Opaque,
+            alpha_cutoff: 0.5,
+            double_sided: false,
+            normal_scale: 1.0,
+            occlusion_strength: 1.0,
+        },
+        base_color_texture: Some(0),
+        metallic_roughness_texture: Some(2),
+        normal_texture: Some(1),
+        occlusion_texture: Some(2),
+        emissive_texture: None,
+    };
+    Ok(GroundResources {
+        vertex_buffer,
+        index_buffer,
+        index_count: geometry.indices.len() as u32,
+        textures,
+        material,
+        gpu_bytes,
+    })
+}
+
+fn create_one_pixel_texture(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    queue: vk::Queue,
+    queue_family_index: u32,
+    format: vk::Format,
+    pixel: [u8; 4],
+    mode: TextureMipMode,
+) -> Result<TextureResource> {
+    let texture = TextureAsset::from_rgba8(1, 1, &pixel, mode)?;
+    TextureResource::new(
+        device,
+        memory_properties,
+        queue,
+        queue_family_index,
+        format,
+        &texture,
+    )
+}
+
+fn placed_model(
+    handle: GpuModelHandle,
+    position: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+) -> PlacedModel {
+    PlacedModel {
+        handle,
+        transform: Mat4::from_scale_rotation_translation(scale, rotation, position),
+        material_sets: Vec::new(),
+    }
+}
+
+fn texture_info(
+    index: Option<usize>,
+    textures: &[TextureResource],
+    fallback: &TextureResource,
+) -> vk::DescriptorImageInfo {
+    let texture = index
+        .and_then(|index| textures.get(index))
+        .unwrap_or(fallback);
+    vk::DescriptorImageInfo::default()
+        .sampler(texture.sampler)
+        .image_view(texture.view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+}
+
+fn vertex_attribute(
+    location: u32,
+    format: vk::Format,
+    offset: usize,
+) -> vk::VertexInputAttributeDescription {
+    vk::VertexInputAttributeDescription {
+        location,
+        binding: 0,
+        format,
+        offset: offset as u32,
+    }
+}
+
+fn struct_bytes<T>(value: &T) -> &[u8] {
+    // SAFETY: Callers use repr(C, align(16)) structures containing only initialized fixed arrays.
+    unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
 }
 
 struct ShaderModule {
@@ -413,7 +1021,7 @@ impl ShaderModule {
         let words = ash::util::read_spv(&mut Cursor::new(bytes))
             .map_err(VulkanRendererError::InvalidShader)?;
         let create_info = vk::ShaderModuleCreateInfo::default().code(&words);
-        // SAFETY: `words` contains the embedded SPIR-V and remains alive during module creation.
+        // SAFETY: `words` contains embedded SPIR-V and remains alive during module creation.
         let handle = unsafe { device.create_shader_module(&create_info, None)? };
         Ok(Self {
             device: device.clone(),
@@ -424,627 +1032,7 @@ impl ShaderModule {
 
 impl Drop for ShaderModule {
     fn drop(&mut self) {
-        // SAFETY: This guard owns the shader module and all pipelines have already been created.
+        // SAFETY: The shader module is owned here and pipelines are created before this local drops.
         unsafe { self.device.destroy_shader_module(self.handle, None) };
-    }
-}
-
-pub(super) struct BufferAllocation {
-    device: ash::Device,
-    pub(super) buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    size: vk::DeviceSize,
-    memory_flags: vk::MemoryPropertyFlags,
-}
-
-impl BufferAllocation {
-    pub(super) fn new(
-        device: &ash::Device,
-        memory_properties: &vk::PhysicalDeviceMemoryProperties,
-        size: usize,
-        usage: vk::BufferUsageFlags,
-        required_memory: vk::MemoryPropertyFlags,
-        preferred_memory: vk::MemoryPropertyFlags,
-        memory_description: &'static str,
-    ) -> Result<Self> {
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(size as vk::DeviceSize)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        // SAFETY: The buffer uses a valid nonzero size and an explicit GPU usage.
-        let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
-        let mut allocation = Self {
-            device: device.clone(),
-            buffer,
-            memory: vk::DeviceMemory::null(),
-            size: size as vk::DeviceSize,
-            memory_flags: vk::MemoryPropertyFlags::empty(),
-        };
-        // SAFETY: The buffer is live and owned by this allocation.
-        let requirements = unsafe { allocation.device.get_buffer_memory_requirements(buffer) };
-        let (memory_type_index, memory_flags) = select_memory_type(
-            memory_properties,
-            &requirements,
-            required_memory,
-            preferred_memory,
-            memory_description,
-        )?;
-        let allocation_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type_index);
-        // SAFETY: The selected memory type is compatible with the buffer and meets its size requirement.
-        allocation.memory = unsafe { allocation.device.allocate_memory(&allocation_info, None)? };
-        allocation.memory_flags = memory_flags;
-        // SAFETY: Buffer and memory belong to the same device and are not bound elsewhere.
-        unsafe {
-            allocation
-                .device
-                .bind_buffer_memory(allocation.buffer, allocation.memory, 0)?
-        };
-        Ok(allocation)
-    }
-
-    fn upload(&self, data: &[u8]) -> Result<()> {
-        if data.len() as vk::DeviceSize > self.size {
-            return Err(VulkanRendererError::BufferUploadTooLarge {
-                actual: data.len(),
-                capacity: self.size,
-            });
-        }
-        if !self
-            .memory_flags
-            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
-        {
-            return Err(VulkanRendererError::NoCompatibleMemory(
-                "host-visible upload",
-            ));
-        }
-        // SAFETY: The allocation is host-visible and remains mapped only for this upload.
-        let mapped = unsafe {
-            self.device
-                .map_memory(self.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
-        };
-        // SAFETY: The mapped allocation is at least `requirements.size`, `data` is valid for
-        // `data.len()` bytes, and the source/destination regions do not overlap.
-        unsafe {
-            ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len());
-        }
-        let flush_result = if !self
-            .memory_flags
-            .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
-        {
-            let range = [vk::MappedMemoryRange::default()
-                .memory(self.memory)
-                .offset(0)
-                .size(vk::WHOLE_SIZE)];
-            // SAFETY: The whole mapped allocation is flushed, so the range obeys atom alignment.
-            unsafe { self.device.flush_mapped_memory_ranges(&range) }
-        } else {
-            Ok(())
-        };
-        // SAFETY: The mapping was opened above and is no longer needed after the upload.
-        unsafe { self.device.unmap_memory(self.memory) };
-        flush_result?;
-        Ok(())
-    }
-
-    pub(super) fn download(&self, byte_count: usize) -> Result<Vec<u8>> {
-        if byte_count as vk::DeviceSize > self.size {
-            return Err(VulkanRendererError::BufferUploadTooLarge {
-                actual: byte_count,
-                capacity: self.size,
-            });
-        }
-        if !self
-            .memory_flags
-            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
-        {
-            return Err(VulkanRendererError::NoCompatibleMemory(
-                "host-visible readback",
-            ));
-        }
-        // SAFETY: The allocation is host-visible, and callers wait for its GPU writer first.
-        let mapped = unsafe {
-            self.device
-                .map_memory(self.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
-        };
-        let invalidate_result = if !self
-            .memory_flags
-            .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
-        {
-            let range = [vk::MappedMemoryRange::default()
-                .memory(self.memory)
-                .offset(0)
-                .size(vk::WHOLE_SIZE)];
-            // SAFETY: The whole mapped allocation is invalidated, satisfying atom alignment.
-            unsafe { self.device.invalidate_mapped_memory_ranges(&range) }
-        } else {
-            Ok(())
-        };
-        if let Err(error) = invalidate_result {
-            // SAFETY: The map operation above succeeded and must be closed on this error path.
-            unsafe { self.device.unmap_memory(self.memory) };
-            return Err(error.into());
-        }
-        let mut bytes = vec![0; byte_count];
-        // SAFETY: The mapped allocation covers the requested byte count and destination is sized.
-        unsafe {
-            ptr::copy_nonoverlapping(mapped.cast::<u8>(), bytes.as_mut_ptr(), byte_count);
-            self.device.unmap_memory(self.memory);
-        }
-        Ok(bytes)
-    }
-}
-
-fn select_memory_type(
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    requirements: &vk::MemoryRequirements,
-    required: vk::MemoryPropertyFlags,
-    preferred: vk::MemoryPropertyFlags,
-    description: &'static str,
-) -> Result<(u32, vk::MemoryPropertyFlags)> {
-    let mut fallback = None;
-    for index in 0..memory_properties.memory_type_count {
-        if requirements.memory_type_bits & (1 << index) == 0 {
-            continue;
-        }
-        let flags = memory_properties.memory_types[index as usize].property_flags;
-        if !flags.contains(required) {
-            continue;
-        }
-        fallback.get_or_insert((index, flags));
-        if flags.contains(required | preferred) {
-            return Ok((index, flags));
-        }
-    }
-    fallback.ok_or(VulkanRendererError::NoCompatibleMemory(description))
-}
-
-struct MeshUploadLayout {
-    vertex_size: u64,
-    index_offset: u64,
-    index_copy_size: u64,
-}
-
-fn upload_static_mesh(
-    device: &ash::Device,
-    queue: vk::Queue,
-    queue_family_index: u32,
-    staging: &BufferAllocation,
-    vertex_buffer: &BufferAllocation,
-    index_buffer: &BufferAllocation,
-    layout: MeshUploadLayout,
-) -> Result<()> {
-    let pool_info = vk::CommandPoolCreateInfo::default()
-        .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-        .queue_family_index(queue_family_index);
-    // SAFETY: The queue family supports graphics and therefore transfer commands.
-    let command_pool = unsafe { device.create_command_pool(&pool_info, None)? };
-    let result = (|| {
-        let allocate_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        // SAFETY: The transient pool is live and allocated for this queue family.
-        let command_buffers = unsafe { device.allocate_command_buffers(&allocate_info)? };
-        let command_buffer = command_buffers[0];
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: The command buffer is freshly allocated and not in flight.
-        unsafe { device.begin_command_buffer(command_buffer, &begin_info)? };
-        let copies = [
-            vk::BufferCopy::default().size(layout.vertex_size),
-            vk::BufferCopy::default()
-                .src_offset(layout.index_offset)
-                .size(layout.index_copy_size),
-        ];
-        // SAFETY: Source and destination buffers are live, the copied ranges fit, and both
-        // copy sizes and offsets are four-byte aligned as required by vkCmdCopyBuffer.
-        unsafe {
-            device.cmd_copy_buffer(
-                command_buffer,
-                staging.buffer,
-                vertex_buffer.buffer,
-                &copies[..1],
-            );
-            device.cmd_copy_buffer(
-                command_buffer,
-                staging.buffer,
-                index_buffer.buffer,
-                &copies[1..],
-            );
-            let buffer_barriers = [
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::VERTEX_ATTRIBUTE_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(vertex_buffer.buffer)
-                    .offset(0)
-                    .size(layout.vertex_size),
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::INDEX_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(index_buffer.buffer)
-                    .offset(0)
-                    .size(layout.index_copy_size),
-            ];
-            // SAFETY: The buffer ranges were written by the preceding transfer operations and
-            // the destination access masks match the later vertex-input reads on this queue.
-            device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::VERTEX_INPUT,
-                vk::DependencyFlags::empty(),
-                &[],
-                &buffer_barriers,
-                &[],
-            );
-            device.end_command_buffer(command_buffer)?;
-        }
-        let command_buffers = [command_buffer];
-        let submissions = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
-        // SAFETY: This queue is idle during initialization/recreation and the command buffer
-        // references only live buffers that remain owned until queue_wait_idle completes.
-        unsafe {
-            device.queue_submit(queue, &submissions, vk::Fence::null())?;
-            device.queue_wait_idle(queue)?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        // SAFETY: Best-effort idle before destroying the transient pool on an upload error.
-        let _ = unsafe { device.device_wait_idle() };
-    }
-    // SAFETY: The queue has been idled on success; on error the device was idled above.
-    unsafe { device.destroy_command_pool(command_pool, None) };
-    result
-}
-
-fn align_up_4(size: usize) -> usize {
-    (size + 3) & !3
-}
-
-impl Drop for BufferAllocation {
-    fn drop(&mut self) {
-        // SAFETY: The scene owner idles the device before destruction or drops this allocation before
-        // any command using it has been submitted.
-        unsafe {
-            if self.buffer != vk::Buffer::null() {
-                self.device.destroy_buffer(self.buffer, None);
-            }
-            if self.memory != vk::DeviceMemory::null() {
-                self.device.free_memory(self.memory, None);
-            }
-        }
-    }
-}
-
-fn matrix_bytes(values: &[[f32; 4]; 4]) -> &[u8] {
-    // SAFETY: The matrix is exactly sixteen initialized f32 values with no padding between them.
-    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
-}
-
-struct TextureResource {
-    device: ash::Device,
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    view: vk::ImageView,
-    sampler: vk::Sampler,
-    mip_levels: u32,
-}
-
-impl TextureResource {
-    fn new(
-        device: &ash::Device,
-        memory_properties: &vk::PhysicalDeviceMemoryProperties,
-        queue: vk::Queue,
-        queue_family_index: u32,
-        format: vk::Format,
-        decoded: &TextureAsset,
-    ) -> Result<Self> {
-        let mip_levels = decoded.mip_levels.len() as u32;
-        let mut staging_data = Vec::new();
-        let mut copy_regions = Vec::with_capacity(decoded.mip_levels.len());
-        for (mip_level, level) in decoded.mip_levels.iter().enumerate() {
-            let buffer_offset = staging_data.len() as u64;
-            staging_data.extend_from_slice(&level.rgba8);
-            copy_regions.push(
-                vk::BufferImageCopy::default()
-                    .buffer_offset(buffer_offset)
-                    .buffer_row_length(0)
-                    .buffer_image_height(0)
-                    .image_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: mip_level as u32,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                    .image_extent(vk::Extent3D {
-                        width: level.width,
-                        height: level.height,
-                        depth: 1,
-                    }),
-            );
-        }
-
-        let staging = BufferAllocation::new(
-            device,
-            memory_properties,
-            staging_data.len(),
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::MemoryPropertyFlags::HOST_VISIBLE,
-            vk::MemoryPropertyFlags::HOST_COHERENT,
-            "host-visible texture staging",
-        )?;
-        staging.upload(&staging_data)?;
-
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width: decoded.width,
-                height: decoded.height,
-                depth: 1,
-            })
-            .mip_levels(mip_levels)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-        // SAFETY: The decoded dimensions are nonzero and the chosen format supports sampling.
-        let image = unsafe { device.create_image(&image_info, None)? };
-        let mut texture = Self {
-            device: device.clone(),
-            image,
-            memory: vk::DeviceMemory::null(),
-            view: vk::ImageView::null(),
-            sampler: vk::Sampler::null(),
-            mip_levels,
-        };
-        // SAFETY: The image is live and owned by this texture.
-        let requirements = unsafe { device.get_image_memory_requirements(image) };
-        let (memory_type_index, _) = select_memory_type(
-            memory_properties,
-            &requirements,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            "device-local sampled texture",
-        )?;
-        let allocation_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type_index);
-        // SAFETY: The selected memory type meets the image's size and type-bit requirements.
-        texture.memory = unsafe { device.allocate_memory(&allocation_info, None)? };
-        // SAFETY: Image and memory belong to the same device and the allocation meets requirements.
-        unsafe { device.bind_image_memory(image, texture.memory, 0)? };
-        texture.upload_mips(queue, queue_family_index, &staging, &copy_regions)?;
-
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: mip_levels,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        // SAFETY: The view covers every color mip level of this live image.
-        texture.view = unsafe { device.create_image_view(&view_info, None)? };
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-            .address_mode_u(vk::SamplerAddressMode::REPEAT)
-            .address_mode_v(vk::SamplerAddressMode::REPEAT)
-            .address_mode_w(vk::SamplerAddressMode::REPEAT)
-            .min_lod(0.0)
-            .max_lod(mip_levels.saturating_sub(1) as f32)
-            .border_color(vk::BorderColor::INT_OPAQUE_BLACK);
-        // SAFETY: The sampler uses supported linear filtering and valid mip bounds.
-        texture.sampler = unsafe { device.create_sampler(&sampler_info, None)? };
-        Ok(texture)
-    }
-
-    fn upload_mips(
-        &self,
-        queue: vk::Queue,
-        queue_family_index: u32,
-        staging: &BufferAllocation,
-        copy_regions: &[vk::BufferImageCopy],
-    ) -> Result<()> {
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-            .queue_family_index(queue_family_index);
-        // SAFETY: This queue family supports graphics and transfer commands.
-        let command_pool = unsafe { self.device.create_command_pool(&pool_info, None)? };
-        let result = (|| {
-            let allocate_info = vk::CommandBufferAllocateInfo::default()
-                .command_pool(command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            // SAFETY: The transient command pool is live and owns this primary command buffer.
-            let command_buffers = unsafe { self.device.allocate_command_buffers(&allocate_info)? };
-            let command_buffer = command_buffers[0];
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            // SAFETY: The command buffer is allocated from the live transient pool.
-            unsafe {
-                self.device
-                    .begin_command_buffer(command_buffer, &begin_info)?
-            };
-
-            let range = vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: self.mip_levels,
-                base_array_layer: 0,
-                layer_count: 1,
-            };
-            let to_transfer = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.image)
-                .subresource_range(range)];
-            // SAFETY: The image is exclusively owned here and every mip starts undefined.
-            unsafe {
-                self.device.cmd_pipeline_barrier(
-                    command_buffer,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &to_transfer,
-                );
-                self.device.cmd_copy_buffer_to_image(
-                    command_buffer,
-                    staging.buffer,
-                    self.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    copy_regions,
-                );
-            }
-            let to_sample = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.image)
-                .subresource_range(range)];
-            // SAFETY: All mip levels were written by the preceding copy and are now read-only.
-            unsafe {
-                self.device.cmd_pipeline_barrier(
-                    command_buffer,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &to_sample,
-                );
-                self.device.end_command_buffer(command_buffer)?;
-            }
-            let command_buffers = [command_buffer];
-            let submissions = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
-            // SAFETY: Staging and image remain alive until the queue has completed this submission.
-            unsafe {
-                self.device
-                    .queue_submit(queue, &submissions, vk::Fence::null())?;
-                self.device.queue_wait_idle(queue)?;
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            // SAFETY: Ensure no command from the temporary pool is still executing before teardown.
-            let _ = unsafe { self.device.device_wait_idle() };
-        }
-        // SAFETY: The queue is idle on success and was idled above on error.
-        unsafe { self.device.destroy_command_pool(command_pool, None) };
-        result
-    }
-}
-
-impl Drop for TextureResource {
-    fn drop(&mut self) {
-        // SAFETY: The owning swapchain idles the device before this resource is released.
-        unsafe {
-            if self.sampler != vk::Sampler::null() {
-                self.device.destroy_sampler(self.sampler, None);
-            }
-            if self.view != vk::ImageView::null() {
-                self.device.destroy_image_view(self.view, None);
-            }
-            if self.image != vk::Image::null() {
-                self.device.destroy_image(self.image, None);
-            }
-            if self.memory != vk::DeviceMemory::null() {
-                self.device.free_memory(self.memory, None);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{VulkanRendererError, align_up_4, select_memory_type};
-    use ash::vk;
-
-    #[test]
-    fn memory_selection_prefers_coherent_host_memory() {
-        let memory_types = std::array::from_fn(|index| {
-            let property_flags = match index {
-                0 => vk::MemoryPropertyFlags::HOST_VISIBLE,
-                1 => vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                _ => vk::MemoryPropertyFlags::empty(),
-            };
-            vk::MemoryType {
-                property_flags,
-                heap_index: 0,
-            }
-        });
-        let properties = vk::PhysicalDeviceMemoryProperties {
-            memory_type_count: 2,
-            memory_types,
-            ..Default::default()
-        };
-        let requirements = vk::MemoryRequirements {
-            memory_type_bits: 0b11,
-            ..Default::default()
-        };
-
-        let (index, flags) = select_memory_type(
-            &properties,
-            &requirements,
-            vk::MemoryPropertyFlags::HOST_VISIBLE,
-            vk::MemoryPropertyFlags::HOST_COHERENT,
-            "test",
-        )
-        .unwrap();
-        assert_eq!(index, 1);
-        assert!(flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT));
-    }
-
-    #[test]
-    fn memory_selection_reports_missing_required_properties() {
-        let properties = vk::PhysicalDeviceMemoryProperties::default();
-        let requirements = vk::MemoryRequirements {
-            memory_type_bits: 1,
-            ..Default::default()
-        };
-
-        assert!(matches!(
-            select_memory_type(
-                &properties,
-                &requirements,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                vk::MemoryPropertyFlags::empty(),
-                "device-local vertex",
-            ),
-            Err(VulkanRendererError::NoCompatibleMemory(
-                "device-local vertex"
-            ))
-        ));
-    }
-
-    #[test]
-    fn staging_offsets_and_copy_sizes_are_four_byte_aligned() {
-        assert_eq!(align_up_4(0), 0);
-        assert_eq!(align_up_4(1), 4);
-        assert_eq!(align_up_4(620), 620);
-        assert_eq!(align_up_4(78), 80);
     }
 }

@@ -1,56 +1,56 @@
-# Vulkan presentation pipeline
+# Vulkan rendering and asset pipeline
 
 ## Current initialization
 
-1. Dynamically load the system Vulkan loader through `ash`.
-2. Query the instance extensions required by the active `winit` display.
-3. Require `VK_LAYER_KHRONOS_validation` and `VK_EXT_debug_utils` in debug builds; `--validation` can require them in release builds.
-4. Create a Vulkan 1.0 instance and native window surface.
-5. Select a device with `VK_KHR_swapchain` and one queue family that supports graphics and presentation. Prefer discrete, then integrated GPUs.
-6. Create the logical device, swapchain, color/depth render pass, one depth image per swapchain image, framebuffers, command pool, command buffers, fences, and semaphores.
-7. Compile the forest GLSL shaders with Vulkan SDK `glslc`, create a descriptor-set layout and depth-tested textured-and-lit pipeline, upload static mesh buffers and the bundled PNG texture, allocate one host-visible camera uniform and descriptor set per frame in flight, and record indexed submesh draws.
+1. Dynamically load the Vulkan loader through `ash`, create the native surface, and select a graphics/present queue.
+2. Create the swapchain, per-image depth attachments/framebuffers, and two frames in flight.
+3. Start one bounded CPU glTF worker. It imports the four licensed static reference models while the renderer prepares GPU resources.
+4. Upload model vertex/index buffers through host-visible staging into device-local allocations. Decode and resize limits remain in `project3-6k-assets`; this crate owns Vulkan images, samplers, buffers, cache entries, and destruction.
+5. Upload external base-color, normal, metallic-roughness, and AO data. Color/emissive maps use sRGB images with linear-light mip reduction. Normal maps use linear UNORM images and vector-aware mip reduction. Metallic-roughness and AO use linear UNORM data and data-space mip reduction.
+6. Load the Poly Haven forest-ground color, OpenGL normal, and ARM maps into a tiled technical ground plane. Build PBR descriptors, initialize per-frame scene uniforms, and record indexed draws for the external models.
 
-The scene embeds the workspace asset `assets/forest_noise.png` at build time and loads it through `project3-6k-assets`. The renderer-independent manager decodes to RGBA8 under a 16 MiB limit, creates an sRGB mip chain on the CPU, and tracks the CPU copies under resident-byte and asset-count budgets. Vulkan uploads every level through a temporary staging buffer into a device-local sampled image. The image transitions from undefined to transfer destination and then shader-read-only. A linear repeat sampler exposes the levels through descriptor binding 1; camera matrices remain at binding 0. The vertex color multiplies the sampled texture. GPU texture streaming and hot reload are deferred.
+The CPU importer accepts bounded local glTF 2.0 and GLB static triangle data, retains node transforms and PBR maps, and rejects unsupported deformation, line/point primitives, and external paths that escape the model directory. `AsyncModelLoader` bounds both queues. The current scene waits for its startup requests; asynchronous runtime loading and streaming are not implemented.
 
-The assets crate now also imports static glTF 2.0 and GLB data on the CPU. It resolves bounded local/data-URI buffers, decodes common raster images, retains mesh instances and transforms, and extracts metallic, roughness, base-color, emissive, normal, and occlusion material data. Generated vertex normals/tangents fill missing attributes for static triangle primitives. The model cache has byte/count limits, and a single background worker can import models through bounded queues. External references are restricted to the model directory; skinned/morphed meshes and line/point primitives are rejected explicitly. This CPU path is not yet connected to Vulkan drawing.
+The Vulkan GPU cache allows up to 32 models and 256 MiB of estimated resident model buffers and texture mip data. Generational handles reject stale references. Upload staging allocations are temporary. Cache entries and their RAII resource wrappers are released after the renderer waits for device idle. The current unload API is explicitly named `unload_after_device_idle`; callers must honor that lifetime precondition. Swapchain resize destroys framebuffers and scene resources after an idle wait, then rebuilds them.
 
-The static geometry builder turns the tree and ridge silhouettes into shallow prisms, emits a horizontal ground plane, and creates outward normals for prism sides and front/back faces. Each canopy front is folded into two shallow facets with normals derived from their actual triangles, producing visible directional-light contrast from the default view. The renderer applies each node's inverse-transpose normal transform when it bakes vertices for the one-time upload. The fragment shader combines the sampled, vertex-tinted albedo with a fixed world-space directional light and a 0.26 ambient floor using Lambert diffuse. Lighting values are constants in the shader, so no extra uniform or per-frame update is needed. This geometry is authored for the technical demo; it is not a general-purpose model importer or dynamic mesh path.
+Imported materials currently support `TEXCOORD_0`, opaque and alpha-mask modes, base color, metallic, roughness, normal scale, AO strength, emissive, and double-sided normal handling. Alpha blend and alternate texture coordinate sets return typed errors instead of silently rendering incorrectly. The PBR fragment shader evaluates a GGX microfacet sun response and a restrained ambient term, applies normal mapping, and uses a temporary Reinhard display transform on the LDR swapchain.
 
-Core's bounded `Scene` represents the horizontal ground, colored forest panel, three trees, and distant ridge as six mesh-handle nodes with local TRS transforms. The renderer applies each node's matrix to its local vertex positions and the inverse-transpose normal matrix to its normals before the device-local upload. Node insertion order maps to indexed draw ranges, keeping the ridge last while allowing depth testing to determine visibility. This scene is static; changing a `Scene` transform after upload does not update the GPU mesh yet.
-
-FIFO presentation is used because it is guaranteed by Vulkan and provides paced presentation. Surface formats prefer BGRA8 sRGB when available, then use the first supported format. The initial pipeline does not depend on Vulkan 1.3 dynamic rendering or other optional features.
-
-## Frame submission
+## Rendering status and dependencies
 
 ```mermaid
-sequenceDiagram
-  participant CPU as Platform / CPU
-  participant GPU as Graphics queue
-  participant WSI as Presentation engine
-  CPU->>CPU: Wait for current frame fence
-  CPU->>CPU: Update this frame's camera uniform
-  CPU->>WSI: Acquire image (image-available semaphore)
-  CPU->>CPU: Wait for prior fence owning this image
-  CPU->>GPU: Submit forest pass with matching descriptor set
-  Note over GPU: Wait image-available; signal image render-finished
-  GPU->>WSI: Present acquired image
-  Note over WSI: Wait image-specific render-finished semaphore
+flowchart LR
+  CPU[glTF decode + validation] -->|CpuModelAsset| GPU[bounded Vulkan asset cache]
+  GPU --> Scene[PBR reference scene]
+  Scene --> LDR[LDR swapchain output]
+  LDR --> Capture[optional PNG readback]
+  Scene -. next .-> HDR[FP16 HDR target + tone map]
+  HDR -. next .-> Shadow[directional shadow map]
 ```
 
-There are two CPU frames in flight. Per-image fences prevent a swapchain image from being recorded while its previous submission is pending. Render-finished semaphores are indexed by swapchain image so they are not reused before presentation has consumed the prior wait operation for that image. The renderer updates a frame's camera uniform only after its fence signals and reports whether `queue_submit` succeeded separately from whether swapchain recreation is needed, so automated frame counts do not count acquire failures as rendered frames.
+Current renderer features: external glTF/GLB and raster import; role-correct PBR texture formats and mipmaps; device-local mesh uploads; GPU cache budget and RAII lifetime; directional sunlight; GGX PBR; alpha-masked foliage; depth testing; and PNG swapchain readback.
 
-## Resize and teardown
+Not yet implemented: a floating-point HDR render target, dedicated tone-mapping pass, shadow maps/cascades, atmospheric fog, material blending, alternative UV sets, GPU asset streaming, and world/terrain streaming. The current in-shader display transform is not a claim of a full HDR pipeline.
 
-Zero-sized windows suspend drawing. A nonzero resize, out-of-date acquisition, or suboptimal presentation triggers a device-idle wait, destruction of swapchain-dependent resources, and recreation. Framebuffers are destroyed before the render pass, and image views before the swapchain. The renderer is dropped before its native window. `--resize-stress` requests two sizes, minimizes, and restores the window; the run fails unless it observes resize events including a zero extent.
+## Frame submission and capture
 
-For repeatable lifecycle checks, the app accepts `--run-frames N` (positive N; exits after N successful submissions), `--auto-close` (exits immediately after renderer initialization), and `--validation` (requires validation layers). All options go through the normal event-loop exit and shutdown code. Debug builds always enable validation. The callback counts and logs every warning/error; after renderer and window destruction the app exits nonzero if any occurred. Shutdown logs the submitted frame count.
+The renderer has two frames in flight. It waits on the frame fence before updating that frame's scene uniform, acquires an image, waits for the prior image owner, records the scene, submits, and presents with image-indexed semaphores. When capture is requested and the surface supports `TRANSFER_SRC`, the captured swapchain image is copied to a bounded host-visible buffer, mapped after the fence, invalidated if non-coherent, converted from BGRA where needed, and encoded to PNG. Capture stalls one frame and is opt-in.
 
-The render pass clears the per-image depth attachment to 1.0 and uses a pipeline with depth testing and writes enabled (`LESS`). The depth format is selected from the physical device's optimal-tiling support. See [Decision 0007](../decisions/0007-depth-attachments.md) for the per-image lifetime rationale. The sampled texture uses `R8G8B8A8_SRGB` when the device reports sampled-image and linear-filter support.
+The pre-upgrade comparison is [baseline-before-rendering-upgrade.png](../../artifacts/visual-verification/baseline-before-rendering-upgrade.png). The PBR foundation output is [pbr-foundation-stage-3.png](../../artifacts/visual-verification/pbr-foundation-stage-3.png). The latter was opened and visually checked at 1280×720: imported models, tiled ground material, normal/material texture response, and direct lighting are visible. It has no cast shadows and remains a sparse technical scene; those are still open visual gaps.
 
-Run `scripts/validation-smoke.ps1` to execute the 1, 60, and 600 frame runs and a resize-stress run. Logs go under `target/validation-runs/`. The scene has a horizontal ground plane and volumetric low-poly silhouette prisms, with separate indexed ranges at different world-space depths and one depth attachment per swapchain image. Automated validation does not prove the final pixels; ground contact, texture appearance, and directional shading still require the manual checklist.
+For local verification, set `VULKAN_SDK` to a Vulkan SDK that includes `glslc`, then run:
 
-For visual evidence, pass `--capture-frame PATH` to the app. When the surface supports `TRANSFER_SRC`, the renderer copies one submitted swapchain image into a bounded host-visible buffer, waits for its fence, handles non-coherent memory invalidation and BGRA-to-RGBA conversion, then writes PNG. The operation is opt-in and stalls the captured frame. A 256 MiB cap prevents unreasonable readback allocations. The verified pre-renderer-upgrade baseline is `artifacts/visual-verification/baseline-before-rendering-upgrade.png`; GPU readback therefore replaces external window-capture tools for renderer comparisons.
+```powershell
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo run -p project3-6k-app -- --run-frames 5 --validation --capture-frame artifacts/visual-verification/current.png
+```
 
-## Next rendering steps
+The Vulkan run exercises the native application, external asset import, upload, rendering, validation callback, GPU readback, and shutdown. A successful compile alone does not verify rendered pixels. The optional screenshot command intentionally stalls the captured frame; do not use that frame for performance measurements.
 
-The shader build path invokes `glslc` from `VULKAN_SDK` and writes SPIR-V to Cargo's `OUT_DIR`; no compiler dependency or committed shader binaries are needed. Static mesh data is copied through temporary host-visible staging buffers into device-local vertex/index and texture images, with explicit transfer-to-input/shader-read barriers. `glam` supplies camera math in core; Vulkan receives only a column-major matrix array. Depth attachment ownership and format selection are described in [Decision 0007](../decisions/0007-depth-attachments.md), static low-poly shading in [Decision 0009](../decisions/0009-basic-lighting.md), the authored spatial demo geometry in [Decision 0013](../decisions/0013-spatial-low-poly-forest.md), and CPU importer selection in [Decision 0014](../decisions/0014-cpu-gltf-import.md). GPU asset caching, PBR shading, HDR/tone mapping, and shadow maps remain the next rendering phases.
+## Next implementation steps
+
+1. Render to a supported FP16 color-attachment image and add a fullscreen tone-mapping pass to the swapchain.
+2. Add a depth-only directional shadow pass, beginning with one shadow map and measured bias/PCF tuning; consider cascades only after visual validation.
+3. Compare screenshots and capture startup CPU import, GPU upload/resident bytes, and steady-state frame timing. Improve scene composition and evaluate a suitably sized licensed tree asset before broadening the reference scene.
+
+See [Decision 0014](../decisions/0014-cpu-gltf-import.md) for CPU library selection and [Decision 0015](../decisions/0015-vulkan-pbr-foundation.md) for GPU upload, material, and lifetime choices.

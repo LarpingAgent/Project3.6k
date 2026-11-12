@@ -15,7 +15,8 @@ flowchart TD
     Platform --> Window[Native window]
     Vulkan --> Surface[Window surface]
     Vulkan --> GPU[Graphics and presentation queue]
-    GPU --> Swapchain[Acquire → render scene → submit → present]
+    GPU --> Assets[Bounded GPU model/material cache]
+    Assets --> Swapchain[Acquire → PBR scene → submit → present]
 ```
 
 ## Crate responsibilities and dependencies
@@ -34,7 +35,7 @@ The dependency graph is one-way: app → platform → core and Vulkan. There are
 2. `about_to_wait` requests a redraw and waits until the next target frame interval.
 3. The Vulkan renderer waits for the current frame fence and acquires a swapchain image.
 4. It records the active scene with the GLSL graphics pipeline, submits work waiting on image acquisition, then presents after the image-specific render semaphore signals.
-5. Resize and out-of-date events wait for device idle and rebuild swapchain-owned resources.
+5. The scene uses a per-frame camera/sun uniform, role-correct texture descriptors, a GGX PBR shader, and cached device-local model buffers. Resize and out-of-date events wait for device idle and rebuild swapchain-owned resources.
 6. `--run-frames N` exits after N successful queue submissions; `--auto-close` exits after Vulkan initialization. `--resize-stress` exercises size changes and minimized-window suspension. All use the same event-loop and RAII shutdown path as a window close.
 
 ## Error handling
@@ -49,4 +50,4 @@ Gameplay state should remain separate from rendering and native input. Future ne
 
 ## Current limits
 
-The current renderer still draws the authored low-poly forest demo. The CPU asset crate now imports glTF 2.0/GLB geometry, node transforms, raster images, and metallic-roughness materials under explicit memory limits. The model data is not yet uploaded by Vulkan; subsequent steps add a GPU cache, PBR/HDR/shadow passes, and the external reference scene. Visual quality must be checked from rendered pixels, not compilation results.
+The renderer now draws a technical scene with CC0 external glTF models and ground textures. The CPU asset crate imports bounded static glTF 2.0/GLB geometry, node transforms, raster images, and PBR maps. Vulkan owns a bounded GPU model cache, texture-role-correct mip chains, directional GGX PBR, normal mapping, and alpha-masked materials. The scene is still sparse and has no true FP16 HDR target, dedicated tone mapper, cast shadows, atmospheric fog, material blending, or streaming. Visual quality must be checked from rendered pixels, not compilation results. See [the renderer pipeline](docs/rendering/vulkan-pipeline.md) and [Decision 0015](docs/decisions/0015-vulkan-pbr-foundation.md).

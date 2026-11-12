@@ -20,6 +20,10 @@ mod depth_buffer;
 mod forest_mesh;
 #[path = "forest_scene.rs"]
 mod forest_scene;
+#[path = "gpu_asset_cache.rs"]
+mod gpu_asset_cache;
+#[path = "gpu_resources.rs"]
+mod gpu_resources;
 
 use depth_buffer::{DepthAttachment, choose_depth_format};
 use forest_scene::ForestScene;
@@ -51,8 +55,12 @@ pub enum VulkanRendererError {
     NoSupportedDepthFormat,
     #[error("the selected Vulkan device has no linearly-filterable sRGB texture format")]
     NoSupportedTextureFormat,
+    #[error("the selected Vulkan device has no linearly-filterable RGBA8 data texture format")]
+    NoSupportedLinearTextureFormat,
     #[error("could not load a renderer texture asset: {0}")]
     Asset(#[from] project3_6k_assets::AssetError),
+    #[error("could not import an external glTF model: {0}")]
+    ModelImport(#[from] project3_6k_assets::ModelImportError),
     #[error("could not build the scene: {0}")]
     Scene(#[from] project3_6k_core::SceneError),
     #[error("the renderer could not resolve a texture immediately after loading it")]
@@ -61,6 +69,12 @@ pub enum VulkanRendererError {
     MeshTooLarge,
     #[error("Vulkan validation was requested but {0} is unavailable")]
     ValidationUnavailable(&'static str),
+    #[error("could not start the CPU asset worker: {0}")]
+    AssetWorker(#[from] std::io::Error),
+    #[error("could not queue a CPU asset import: {0}")]
+    AssetQueue(#[from] project3_6k_assets::AsyncLoadError),
+    #[error("CPU asset worker did not return a requested model before its timeout")]
+    AssetWorkerTimeout,
     #[error("the embedded GLSL shader could not be decoded: {0}")]
     InvalidShader(#[source] std::io::Error),
     #[error("the selected Vulkan device has no compatible {0} memory type")]
@@ -90,6 +104,28 @@ pub enum VulkanRendererError {
     },
     #[error("could not encode screenshot PNG: {0}")]
     CapturePng(#[from] png::EncodingError),
+    #[error("GPU asset key must contain between 1 and 256 UTF-8 bytes")]
+    InvalidGpuAssetKey,
+    #[error("GPU asset cache limit reached ({limit} models)")]
+    GpuAssetCountExceeded { limit: usize },
+    #[error("GPU asset memory budget exceeded: {resident} + {requested} > {budget} bytes")]
+    GpuAssetBudgetExceeded {
+        resident: usize,
+        requested: usize,
+        budget: usize,
+    },
+    #[error("GPU asset byte accounting overflowed")]
+    GpuAssetSizeOverflow,
+    #[error("GPU model contains invalid or empty triangle geometry")]
+    InvalidGpuAssetGeometry,
+    #[error("GPU model references a missing material")]
+    InvalidGpuAssetMaterial,
+    #[error("GPU model references a missing image")]
+    InvalidGpuAssetTexture,
+    #[error("GPU renderer currently requires TEXCOORD_0; texture coordinate set {0} was requested")]
+    UnsupportedTextureCoordinates(u32),
+    #[error("GPU renderer does not yet support alpha-blended glTF materials")]
+    UnsupportedBlendMaterial,
 }
 
 type Result<T> = std::result::Result<T, VulkanRendererError>;
@@ -508,6 +544,8 @@ impl SwapchainState {
                 .get_physical_device_memory_properties(context.physical_device)
         };
         let texture_format = choose_texture_format(&context.instance, context.physical_device)?;
+        let linear_texture_format =
+            choose_linear_texture_format(&context.instance, context.physical_device)?;
         for _ in &self.images {
             self.depth_images.push(DepthAttachment::new(
                 &self.device,
@@ -523,6 +561,7 @@ impl SwapchainState {
             context.graphics_queue,
             context.queue_family_index,
             texture_format,
+            linear_texture_format,
         )?);
         for image in &self.images {
             let view_info = vk::ImageViewCreateInfo::default()
@@ -606,6 +645,7 @@ impl SwapchainState {
         &mut self,
         context: &VulkanContext,
         view_projection: [[f32; 4]; 4],
+        camera_position: [f32; 3],
         capture_path: Option<&Path>,
     ) -> Result<FrameDrawOutcome> {
         let frame = &self.frames[self.current_frame];
@@ -616,7 +656,7 @@ impl SwapchainState {
         self.forest_scene
             .as_ref()
             .expect("forest scene is initialized with the render pass")
-            .update_camera(self.current_frame, view_projection)?;
+            .update_camera(self.current_frame, view_projection, camera_position)?;
         // SAFETY: The swapchain and semaphore are live. The timeout is intentionally unbounded;
         // acquisition will complete once a presentable image becomes available.
         let (image_index, was_suboptimal) = match unsafe {
@@ -660,7 +700,7 @@ impl SwapchainState {
                     .instance
                     .get_physical_device_memory_properties(context.physical_device)
             };
-            Some(forest_scene::BufferAllocation::new(
+            Some(gpu_resources::BufferAllocation::new(
                 &self.device,
                 &memory_properties,
                 size,
@@ -896,7 +936,12 @@ impl VulkanRenderer {
     }
 
     /// Acquires, records the forest scene, submits, and presents one frame.
-    pub fn draw(&mut self, window: &Window, view_projection: [[f32; 4]; 4]) -> Result<bool> {
+    pub fn draw(
+        &mut self,
+        window: &Window,
+        view_projection: [[f32; 4]; 4],
+        camera_position: [f32; 3],
+    ) -> Result<bool> {
         if self.suspended {
             let size = window.inner_size();
             self.suspended = size.width == 0 || size.height == 0;
@@ -911,9 +956,12 @@ impl VulkanRenderer {
                 return Ok(false);
             }
         }
-        let outcome =
-            self.swapchain
-                .draw(&self.context, view_projection, self.capture_path.as_deref())?;
+        let outcome = self.swapchain.draw(
+            &self.context,
+            view_projection,
+            camera_position,
+            self.capture_path.as_deref(),
+        )?;
         if outcome.captured {
             self.capture_path = None;
         }
@@ -938,6 +986,23 @@ fn choose_texture_format(
         Ok(format)
     } else {
         Err(VulkanRendererError::NoSupportedTextureFormat)
+    }
+}
+
+fn choose_linear_texture_format(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<vk::Format> {
+    let format = vk::Format::R8G8B8A8_UNORM;
+    // SAFETY: The physical device belongs to the live instance.
+    let properties =
+        unsafe { instance.get_physical_device_format_properties(physical_device, format) };
+    let required =
+        vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+    if properties.optimal_tiling_features.contains(required) {
+        Ok(format)
+    } else {
+        Err(VulkanRendererError::NoSupportedLinearTextureFormat)
     }
 }
 

@@ -18,9 +18,9 @@ pub struct Camera {
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            position: Vec3::new(0.0, 0.0, 2.2),
+            position: Vec3::new(0.0, 1.65, 4.5),
             yaw_radians: -std::f32::consts::FRAC_PI_2,
-            pitch_radians: 0.0,
+            pitch_radians: -0.27,
         }
     }
 }
@@ -101,9 +101,14 @@ mod tests {
     #[test]
     fn default_view_projects_forward_world_points_into_vulkan_depth_range() {
         let camera = Camera::default();
+        let direction = Vec3::new(
+            camera.yaw_radians.cos() * camera.pitch_radians.cos(),
+            camera.pitch_radians.sin(),
+            camera.yaw_radians.sin() * camera.pitch_radians.cos(),
+        );
         let center = camera
             .view_projection(16.0 / 9.0)
-            .project_point3(Vec3::ZERO);
+            .project_point3(camera.position() + direction * 10.0);
 
         assert!(center.x.abs() < 0.0001);
         assert!(center.y.abs() < 0.0001);

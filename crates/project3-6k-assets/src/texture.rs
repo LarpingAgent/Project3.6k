@@ -61,6 +61,58 @@ pub struct TextureAsset {
     pub byte_size: usize,
 }
 
+/// Interpretation used while reducing mip texels for an imported glTF image.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TextureMipMode {
+    /// Decode and average RGB in linear light, then encode back to sRGB.
+    SrgbColor,
+    /// Average channels directly for roughness, metallic, AO, and other data textures.
+    LinearData,
+    /// Average decoded tangent-space vectors and renormalize the resulting vector.
+    NormalMap,
+}
+
+impl TextureAsset {
+    /// Builds a complete mip chain from decoded RGBA8 pixels using the map's data role.
+    pub fn from_rgba8(
+        width: u32,
+        height: u32,
+        rgba8: &[u8],
+        mip_mode: TextureMipMode,
+    ) -> Result<Self, AssetError> {
+        let expected = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(AssetError::InvalidDimensions)?;
+        if width == 0 || height == 0 || rgba8.len() != expected {
+            return Err(AssetError::InvalidDimensions);
+        }
+        let mip_levels = generate_mip_chain(
+            TextureMipLevel {
+                width,
+                height,
+                rgba8: rgba8.to_vec(),
+            },
+            mip_mode,
+        )?;
+        let byte_size = mip_levels.iter().try_fold(0usize, |sum, level| {
+            sum.checked_add(level.rgba8.len())
+                .ok_or(AssetError::TextureSizeOverflow)
+        })?;
+        Ok(Self {
+            width,
+            height,
+            mip_levels,
+            byte_size,
+        })
+    }
+}
+
 /// Errors returned by PNG decoding and bounded asset caching.
 #[derive(Debug, Error)]
 pub enum AssetError {
@@ -134,7 +186,7 @@ impl AssetManager {
         }
 
         let base = decode_png(bytes, self.limits.max_decoded_bytes)?;
-        let mip_levels = generate_mip_chain(base)?;
+        let mip_levels = generate_mip_chain(base, TextureMipMode::SrgbColor)?;
         let byte_size = mip_levels.iter().try_fold(0usize, |sum, mip| {
             sum.checked_add(mip.rgba8.len())
                 .ok_or(AssetError::TextureSizeOverflow)
@@ -304,7 +356,10 @@ fn to_rgba8(
     Ok(rgba)
 }
 
-fn generate_mip_chain(base: TextureMipLevel) -> Result<Vec<TextureMipLevel>, AssetError> {
+fn generate_mip_chain(
+    base: TextureMipLevel,
+    mode: TextureMipMode,
+) -> Result<Vec<TextureMipLevel>, AssetError> {
     let mut levels = vec![base];
     while levels
         .last()
@@ -325,30 +380,75 @@ fn generate_mip_chain(base: TextureMipLevel) -> Result<Vec<TextureMipLevel>, Ass
         let mut rgba8 = vec![0; byte_len];
         for y in 0..height {
             for x in 0..width {
-                for channel in 0..4 {
+                let target_offset = ((y * width + x) * 4) as usize;
+                if mode == TextureMipMode::NormalMap {
+                    let mut normal_sum = glam::Vec3::ZERO;
+                    let mut alpha_sum = 0.0f32;
+                    for sample_y in 0..2 {
+                        for sample_x in 0..2 {
+                            let source_x = (x * 2 + sample_x).min(source.width - 1);
+                            let source_y = (y * 2 + sample_y).min(source.height - 1);
+                            let source_offset = ((source_y * source.width + source_x) * 4) as usize;
+                            let normal = glam::Vec3::new(
+                                source.rgba8[source_offset] as f32,
+                                source.rgba8[source_offset + 1] as f32,
+                                source.rgba8[source_offset + 2] as f32,
+                            ) / 127.5
+                                - glam::Vec3::ONE;
+                            normal_sum += normal;
+                            alpha_sum += source.rgba8[source_offset + 3] as f32 / 255.0;
+                        }
+                    }
+                    let normal = normal_sum.try_normalize().unwrap_or(glam::Vec3::Z);
+                    for channel in 0..3 {
+                        let encoded = (normal[channel] + 1.0) * 0.5;
+                        rgba8[target_offset + channel] =
+                            (encoded * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    }
+                    rgba8[target_offset + 3] =
+                        (alpha_sum * 0.25 * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    continue;
+                }
+                for channel in 0..4usize {
                     let mut sum = 0.0f32;
                     for sample_y in 0..2 {
                         for sample_x in 0..2 {
                             let source_x = (x * 2 + sample_x).min(source.width - 1);
                             let source_y = (y * 2 + sample_y).min(source.height - 1);
                             let source_offset =
-                                ((source_y * source.width + source_x) * 4 + channel) as usize;
+                                ((source_y * source.width + source_x) * 4) as usize + channel;
                             let value = source.rgba8[source_offset] as f32 / 255.0;
-                            sum += if channel < 3 {
-                                srgb_to_linear(value)
-                            } else {
-                                value
-                            };
+                            match mode {
+                                TextureMipMode::SrgbColor => {
+                                    sum += if channel < 3 {
+                                        srgb_to_linear(value)
+                                    } else {
+                                        value
+                                    };
+                                }
+                                TextureMipMode::LinearData => sum += value,
+                                TextureMipMode::NormalMap => unreachable!(
+                                    "normal maps were reduced as complete vectors above"
+                                ),
+                            }
                         }
                     }
-                    let target_offset = ((y * width + x) * 4 + channel) as usize;
-                    let average = sum * 0.25;
-                    let encoded = if channel < 3 {
-                        linear_to_srgb(average)
-                    } else {
-                        average
+                    let channel_offset = target_offset + channel;
+                    let average = match mode {
+                        TextureMipMode::SrgbColor => {
+                            let linear = sum * 0.25;
+                            if channel < 3 {
+                                linear_to_srgb(linear)
+                            } else {
+                                linear
+                            }
+                        }
+                        TextureMipMode::LinearData => sum * 0.25,
+                        TextureMipMode::NormalMap => {
+                            unreachable!("normal maps were reduced as complete vectors above")
+                        }
                     };
-                    rgba8[target_offset] = (encoded * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    rgba8[channel_offset] = (average * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -379,7 +479,9 @@ fn linear_to_srgb(value: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetError, AssetLimits, AssetManager, TextureMipLevel, generate_mip_chain};
+    use super::{
+        AssetError, AssetLimits, AssetManager, TextureMipLevel, TextureMipMode, generate_mip_chain,
+    };
 
     const TEST_PNG: &[u8] = include_bytes!("../../../assets/forest_noise.png");
 
@@ -462,9 +564,30 @@ mod tests {
                 50, 50, 50, 255, 60, 60, 60, 255, 70, 70, 70, 255, 80, 80, 80, 255,
             ],
         };
-        let levels = generate_mip_chain(base).unwrap();
+        let levels = generate_mip_chain(base, TextureMipMode::SrgbColor).unwrap();
         assert_eq!((levels[1].width, levels[1].height), (2, 2));
         assert_eq!((levels[2].width, levels[2].height), (1, 1));
         assert!(levels[1].rgba8[12] > 60);
+    }
+
+    #[test]
+    fn linear_and_normal_maps_use_role_aware_mip_reduction() {
+        let pixels = [
+            0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+        ];
+        let linear =
+            super::TextureAsset::from_rgba8(2, 2, &pixels, TextureMipMode::LinearData).unwrap();
+        assert_eq!(linear.mip_levels[1].rgba8, [128, 128, 128, 255]);
+
+        let normals = [
+            255, 128, 128, 255, 255, 128, 128, 255, 255, 128, 128, 255, 255, 128, 128, 255,
+        ];
+        let normal =
+            super::TextureAsset::from_rgba8(2, 2, &normals, TextureMipMode::NormalMap).unwrap();
+        assert_eq!(normal.mip_levels[1].rgba8, [255, 128, 128, 255]);
+        assert!(matches!(
+            super::TextureAsset::from_rgba8(2, 2, &[0; 3], TextureMipMode::SrgbColor),
+            Err(AssetError::InvalidDimensions)
+        ));
     }
 }

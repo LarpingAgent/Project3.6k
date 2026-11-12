@@ -1312,8 +1312,20 @@ mod tests {
                 }),
                 "{asset} did not import its base-color, normal, and packed material maps"
             );
+            let mut minimum = [f32::INFINITY; 3];
+            let mut maximum = [f32::NEG_INFINITY; 3];
+            let mut triangles = 0usize;
+            for primitive in model.meshes.iter().flat_map(|mesh| &mesh.primitives) {
+                triangles += primitive.indices.len() / 3;
+                for vertex in &primitive.vertices {
+                    for axis in 0..3 {
+                        minimum[axis] = minimum[axis].min(vertex.position[axis]);
+                        maximum[axis] = maximum[axis].max(vertex.position[axis]);
+                    }
+                }
+            }
             eprintln!(
-                "{asset}: {} meshes, {} instances, {} materials, {} images, {} CPU bytes",
+                "{asset}: {triangles} triangles, bounds {minimum:?}..{maximum:?}, {} meshes, {} instances, {} materials, {} images, {} CPU bytes",
                 model.meshes.len(),
                 model.instances.len(),
                 model.materials.len(),

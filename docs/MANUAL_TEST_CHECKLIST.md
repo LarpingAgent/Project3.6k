@@ -14,6 +14,15 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 - `cargo run -p project3-6k-app -- --run-frames 5 --validation --capture-frame artifacts/visual-verification/baseline-before-rendering-upgrade.png` captures one real swapchain frame and exits only after five submitted frames. This baseline was captured and opened successfully; inspect it before comparing later builds.
 - **NOT VERIFIED BY AUTOMATION** — After PBR/shadow changes, save a second PNG beside the baseline and compare surface maps, material response, shadow contrast, and foliage detail at the same window extent.
 
+## Rendering and asset foundation
+
+- `cargo test --workspace` exercises bounded glTF/GLB import, real Poly Haven model decoding, texture mip reduction, model cache limits, vertex layout, and the technical ground plane.
+- `cargo clippy --workspace --all-targets -- -D warnings` checks all workspace targets without warnings.
+- `cargo run -p project3-6k-app -- --run-frames 5 --validation --capture-frame artifacts/visual-verification/current.png` opens the application, imports and uploads the external models/maps, renders, captures one swapchain frame, validates, and exits.
+- **VERIFIED** — [pbr-foundation-stage-3.png](../artifacts/visual-verification/pbr-foundation-stage-3.png) was captured from the running Vulkan application and opened at 1280×720. The floor, stump, rocks, upright trunk, foliage, PBR map response, and directional light are visible.
+- **NOT VERIFIED / NOT IMPLEMENTED** — The PBR screenshot has no cast shadows. True floating-point HDR rendering and a separate tone-mapping pass are not implemented yet; the current shader only applies a temporary display transform.
+- **NOT VERIFIED BY AUTOMATION** — Check the technical scene on a second Vulkan GPU, inspect foliage alpha edges and texture tiling at multiple distances, and compare a capture after FP16 HDR and shadow-map work.
+
 ## Phase 2 application and window lifecycle
 
 - **NOT VERIFIED BY AUTOMATION** — Run `cargo run -p project3-6k-app`, confirm the window appears, press Escape, and confirm it closes cleanly.

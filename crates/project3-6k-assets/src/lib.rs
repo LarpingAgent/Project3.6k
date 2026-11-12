@@ -14,4 +14,5 @@ pub use gltf_importer::{
 pub use model_cache::{ModelAssetCache, ModelCacheError, ModelHandle};
 pub use texture::{
     AssetError, AssetLimits, AssetManager, TextureAsset, TextureHandle, TextureMipLevel,
+    TextureMipMode,
 };

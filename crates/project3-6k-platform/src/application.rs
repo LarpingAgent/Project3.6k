@@ -359,7 +359,7 @@ impl EngineApplication {
         };
 
         let renderer_started = Instant::now();
-        let draw_result = renderer.draw(window, view_projection);
+        let draw_result = renderer.draw(window, view_projection, self.camera.position().to_array());
         let renderer_cpu = renderer_started.elapsed();
         let submitted = match draw_result {
             Ok(submitted) => submitted,
