@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 project3-6k-core = { path = "../project3-6k-core" }
+project3-6k-engine.workspace = true
 project3-6k-vulkan = { path = "../project3-6k-vulkan" }
 thiserror.workspace = true
 tracing.workspace = true

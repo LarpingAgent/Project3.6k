@@ -1,11 +1,13 @@
 # Current memory and resource ownership
 
-This describes the implementation at the Phase 0 audit commit. Target ownership rules for ECS, a unified asset registry, and open-world streaming are in [Master Engine Architecture](../architecture/master-architecture.md).
+This describes the implementation after Phase 2. Target ownership rules for ECS, a unified asset registry, and open-world streaming are in [Master Engine Architecture](../architecture/master-architecture.md).
 
 ## CPU ownership
 
-- `FrameClock` stores monotonic timestamps and a frame counter. `FrameProfiler` stores fixed-capacity samples; normal recording does not grow a vector.
-- `EngineApplication` owns `Window`, `VulkanRenderer`, `InputState`, `Camera`, clock, and profiler. It explicitly takes/drops the renderer before the window because the Vulkan surface depends on the native window handles.
+- `EngineApplication` owns `Window`, `VulkanRenderer`, `EngineRuntime`, `Camera`, and `FrameProfiler`. It explicitly shuts down Engine, then takes/drops the renderer before the window because the Vulkan surface depends on the native window handles.
+- `EngineRuntime` owns its validated `EngineConfig`, `FrameClock`, fixed-step accumulator/index, bounded `VecDeque<EngineEvent>` (default maximum 2,048; configured maximum 65,536), and a fixed 8,208-byte logical action/pointer state for all `u16` actions. The event queue cannot grow beyond its configured capacity; a full queue returns a typed error. No references or GPU resources cross the crate boundary.
+- `FrameClock` stores monotonic timestamps and a frame counter. `FrameProfiler` remains in Platform and stores fixed-capacity samples; normal recording does not grow a vector.
+- Platform maps `winit::KeyCode` to stable `ActionId` values. Engine stores logical action state and pointer delta without depending on `winit`.
 - Core `Scene` owns a bounded `Vec<SceneNode>` with value-owned mesh IDs and transforms. It is a prototype and is not the data source for the current Vulkan forest scene.
 - `AssetManager` owns decoded PNG texture mip chains under byte/count/key limits. `ModelAssetCache` owns imported CPU model payloads under byte/count budgets. Both use generation-checked handles. They are implemented and unit-tested but are not integrated into the current renderer's asset load path.
 - `AsyncModelLoader` owns one worker, bounded synchronous request/completion channels, request IDs, and the worker join handle. The worker owns temporary file/decode buffers and returns an owned `CpuModelAsset` or typed error. Dropping the loader closes channels and joins the worker.
@@ -29,6 +31,8 @@ At the audit run, the renderer logged 138,377,796 bytes for model GPU resources,
 ## Unsafe and synchronization boundaries
 
 Unsafe code is concentrated in Vulkan FFI/native-handle interop. Call-site comments record handle and synchronization assumptions. A frame's uniform is written after its in-flight fence is waited. Swapchain images are presentation-owned and not destroyed directly. Validation logs zero warnings/errors in the audit capture and `Drop` releases renderer before the window.
+
+Engine state is only mutated by `EngineApplication` on the winit event thread. `EngineRuntime::shutdown` clears queued events and input state without allocating a replacement queue; the runtime owns no worker or shared mutable state.
 
 ## Required future ownership changes
 

@@ -1,6 +1,6 @@
 # Project3.6k — Master Engine Architecture
 
-- **Status:** Phase 1 architecture reviewed; Phase 2 implementation is in progress.
+- **Status:** Phase 2 — Engine Core complete; Phase 1 review and Phase 2 evidence are linked below.
 - **Baseline:** source commit `d3b21b628bb4714a70fd75ae9f77b5633ceba810`, audited in [Phase 0](foundation-audit.md); boundary review in [Phase 1 Review](phase-1-architecture-review.md).
 - **Rule:** proposed modules and boundaries below are not implemented until their phase starts and its acceptance criteria are agreed.
 
@@ -93,6 +93,10 @@ The present `project3-6k-platform` combines the native event loop, input, camera
 8. Avoid a new crate when an internal module is enough; extraction requires two real consumers, a cycle-prevention need, or a material compile/API boundary.
 
 During Phase 2, `project3-6k-platform` depends on `project3-6k-engine` to adapt OS events and drive engine ticks. This dependency direction is intentional and acyclic. The direct platform-to-Vulkan construction remains temporary; changing that edge requires a concrete renderer contract and belongs to Phase 5.
+
+### Phase 2 runtime defaults
+
+`EngineRuntime` reuses `core::FrameClock`; its default fixed interval is 16,666,667 ns, accepted frame delta is capped at 100 ms, at most five fixed updates run per rendered frame, and the preallocated event queue holds at most 2,048 events. Config validation also caps the fixed-update count at 32 and queue capacity at 65,536 to bound caller-selected CPU work and allocation. `EngineInput` is a fixed bitset for the complete `u16` action range plus a two-value pointer delta. The app uses these defaults; callers can provide a validated `EngineConfig` without adding a config-file dependency.
 
 ### Phase 2 dependency graph
 
@@ -307,7 +311,7 @@ This is a target organization, not an instruction to create empty crates or move
 |---|---|---|
 | 0 — Foundation Audit | Current crates/modules, dependencies, actual/prototype/missing systems, ownership, performance, build/tests/validation; audit report | Evidence linked to current source and runtime; current architecture diagram; findings and priorities. **Complete in `foundation-audit.md`.** |
 | 1 — Master Architecture | Module responsibilities/dependencies, data flow, memory ownership, threading, ECS, render, assets, world, errors, tests, directory layout, phase contracts | All requested diagrams and boundaries written down; current-vs-target distinction explicit; no code implementation. **Review passed with a documented Phase 2 host-adapter correction; see [review](phase-1-architecture-review.md).** |
-| 2 — Engine Core | Engine/application lifecycle state, bounded platform-neutral event queue, action input abstraction, fixed/variable update schedule, engine config/error state, lifecycle logs; reuse existing `FrameClock`, app tracing setup, and platform `winit` loop | Start → OS event translation → engine event/update → render → orderly shutdown integration test; deterministic time/lifecycle/event tests; zero Vulkan validation/lifetime errors; no leaks observed in repeated start/stop and resize runs. |
+| 2 — Engine Core | Engine/application lifecycle state, bounded platform-neutral event queue, action input abstraction, fixed/variable update schedule, engine config/error state, lifecycle logs; reuse existing `FrameClock`, app tracing setup, and platform `winit` loop | Start → OS event translation → engine event/update → render → orderly shutdown integration test; deterministic time/lifecycle/event tests; zero Vulkan validation/lifetime errors; no leaks observed in repeated start/stop and resize runs. **Complete; evidence in [Phase 2 Report](phase-2-engine-core.md).** |
 | 3 — Entity & World Architecture | Generation-safe entity IDs, component storage, systems, hierarchy transforms, Scene/World lifecycle, bounded spatial queries | Create/update/destroy and query at 100k-entity test scale; stale IDs rejected; memory and p50/p95 update/query timings recorded; no Vulkan dependency in World. |
 | 4 — Asset & Resource Architecture | Unified registry/metadata, static glTF/GLB and texture/material CPU assets, bounded async jobs, stable handles, CPU/GPU tier cache and unload | Load external model/material, deduplicate repeated loads, enforce budgets, report import errors, unload/reload while invalidating stale handles, and release GPU objects only after safe retirement. |
 | 5 — Rendering Architecture | Backend-neutral render snapshot, render pass/graph boundary, GPU ownership, PBR/HDR/shadows/IBL, culling, instancing, LOD integration | Renderer consumes snapshot/asset handles without gameplay types or Vulkan leakage; validation clean; pixel/runtime evidence for each rendering gate; frame and memory budgets measured. |

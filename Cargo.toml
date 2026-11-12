@@ -2,6 +2,7 @@
 members = [
     "crates/project3-6k-assets",
     "crates/project3-6k-core",
+    "crates/project3-6k-engine",
     "crates/project3-6k-platform",
     "crates/project3-6k-vulkan",
     "crates/project3-6k-app",
@@ -25,6 +26,7 @@ image = { version = "=0.25.9", default-features = false, features = ["bmp", "hdr
 png = "0.18.1"
 project3-6k-core = { path = "crates/project3-6k-core" }
 project3-6k-assets = { path = "crates/project3-6k-assets" }
+project3-6k-engine = { path = "crates/project3-6k-engine" }
 raw-window-handle = "0.6.2"
 thiserror = "2.0.21"
 tracing = "0.1.44"

@@ -3,7 +3,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use project3_6k_core::{Camera, FrameClock, FrameProfiler};
+use project3_6k_core::{Camera, FrameProfiler};
+use project3_6k_engine::{EngineError, EngineEvent, EngineRuntime, EngineState};
 use project3_6k_vulkan::{VulkanRenderer, VulkanRendererError};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -17,7 +18,9 @@ use winit::{
     window::{CursorGrabMode, Window, WindowId},
 };
 
-use crate::InputState;
+use crate::input::{
+    MOVE_BACKWARD, MOVE_FORWARD, MOVE_LEFT, MOVE_RIGHT, MOVE_UP, action_for_key, is_descending,
+};
 
 const MOUSE_SENSITIVITY: f32 = 0.0025;
 
@@ -32,6 +35,8 @@ pub enum ApplicationError {
     Window(#[from] OsError),
     #[error("could not initialize the renderer: {0}")]
     Renderer(#[from] VulkanRendererError),
+    #[error("engine runtime failed: {0}")]
+    Engine(#[from] EngineError),
     #[error("Vulkan validation reported {warnings} warning(s) and {errors} error(s)")]
     ValidationMessages { warnings: usize, errors: usize },
     #[error(
@@ -110,10 +115,9 @@ struct EngineApplication {
     options: RunOptions,
     window: Option<Window>,
     renderer: Option<VulkanRenderer>,
-    input: InputState,
+    engine: EngineRuntime,
     camera: Camera,
     cursor_captured: bool,
-    clock: Option<FrameClock>,
     profiler: FrameProfiler,
     failure: Option<ApplicationError>,
     frames_rendered: u64,
@@ -153,7 +157,12 @@ impl ApplicationHandler for EngineApplication {
                     event_loop.exit();
                     return;
                 }
-                self.clock = Some(FrameClock::default());
+                if let Err(error) = self.engine.start() {
+                    error!(%error, "engine startup failed");
+                    self.failure = Some(ApplicationError::Engine(error));
+                    event_loop.exit();
+                    return;
+                }
                 self.renderer = Some(renderer);
                 self.window = Some(window);
                 info!(
@@ -161,6 +170,10 @@ impl ApplicationHandler for EngineApplication {
                 );
                 if self.options.auto_close {
                     info!("auto-close requested after renderer initialization");
+                    if let Err(error) = self.engine.request_shutdown() {
+                        error!(%error, "engine shutdown request failed");
+                        self.failure = Some(ApplicationError::Engine(error));
+                    }
                     event_loop.exit();
                 }
             }
@@ -183,7 +196,14 @@ impl ApplicationHandler for EngineApplication {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if self.enqueue_event(event_loop, EngineEvent::ExitRequested) {
+                    if let Err(error) = self.engine.dispatch_pending_events(|_| {}) {
+                        self.fail_engine(event_loop, error);
+                    }
+                }
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 self.resize_events = self.resize_events.saturating_add(1);
                 if size.width == 0 || size.height == 0 {
@@ -194,13 +214,27 @@ impl ApplicationHandler for EngineApplication {
                         "window entered zero extent"
                     );
                 }
+                if !self.enqueue_event(
+                    event_loop,
+                    EngineEvent::WindowResized {
+                        width: size.width,
+                        height: size.height,
+                    },
+                ) {
+                    return;
+                }
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
                 }
             }
             WindowEvent::Focused(false) => {
-                self.input.clear();
+                if !self.enqueue_event(event_loop, EngineEvent::FocusChanged { focused: false }) {
+                    return;
+                }
                 self.set_cursor_capture(false);
+            }
+            WindowEvent::Focused(true) => {
+                self.enqueue_event(event_loop, EngineEvent::FocusChanged { focused: true });
             }
             WindowEvent::MouseInput {
                 button: MouseButton::Left,
@@ -210,12 +244,28 @@ impl ApplicationHandler for EngineApplication {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(key) = event.physical_key {
                     let is_down = event.state == ElementState::Pressed;
-                    self.input.set_key_down(key, is_down);
+                    if let Some(action) = action_for_key(key)
+                        && (!event.repeat || !is_down)
+                        && !self.enqueue_event(
+                            event_loop,
+                            EngineEvent::ActionChanged {
+                                action,
+                                pressed: is_down,
+                            },
+                        )
+                    {
+                        return;
+                    }
                     if is_down && key == KeyCode::Escape {
                         if self.cursor_captured {
                             self.set_cursor_capture(false);
                             info!("mouse released; press Escape again to close");
                         } else {
+                            if self.enqueue_event(event_loop, EngineEvent::ExitRequested)
+                                && let Err(error) = self.engine.dispatch_pending_events(|_| {})
+                            {
+                                self.fail_engine(event_loop, error);
+                            }
                             event_loop.exit();
                         }
                     } else if is_down && !event.repeat {
@@ -236,7 +286,12 @@ impl ApplicationHandler for EngineApplication {
     ) {
         if self.cursor_captured {
             if let DeviceEvent::MouseMotion { delta } = event {
-                self.input.add_mouse_motion(delta);
+                self.enqueue_event(
+                    _event_loop,
+                    EngineEvent::PointerMotion {
+                        delta: [delta.0, delta.1],
+                    },
+                );
             }
         }
     }
@@ -253,6 +308,28 @@ impl ApplicationHandler for EngineApplication {
 }
 
 impl EngineApplication {
+    fn enqueue_event(&mut self, event_loop: &ActiveEventLoop, event: EngineEvent) -> bool {
+        if matches!(
+            self.engine.state(),
+            EngineState::StopRequested | EngineState::Stopped
+        ) {
+            return false;
+        }
+        match self.engine.queue_event(event) {
+            Ok(()) => true,
+            Err(error) => {
+                self.fail_engine(event_loop, error);
+                false
+            }
+        }
+    }
+
+    fn fail_engine(&mut self, event_loop: &ActiveEventLoop, error: EngineError) {
+        error!(%error, "engine runtime failed");
+        self.failure = Some(ApplicationError::Engine(error));
+        event_loop.exit();
+    }
+
     fn set_cursor_capture(&mut self, captured: bool) {
         let Some(window) = self.window.as_ref() else {
             self.cursor_captured = false;
@@ -326,26 +403,44 @@ impl EngineApplication {
     }
 
     fn render_frame(&mut self, event_loop: &ActiveEventLoop) {
-        let frame_time = self.clock.as_mut().map(FrameClock::tick);
-        let delta_seconds = frame_time
-            .map(|time| time.delta.min(Duration::from_millis(100)).as_secs_f32())
-            .unwrap_or(0.0);
-        let [mouse_x, mouse_y] = self.input.take_mouse_delta();
-        if self.cursor_captured {
-            self.camera.rotate(
-                (mouse_x as f32) * MOUSE_SENSITIVITY,
-                (mouse_y as f32) * MOUSE_SENSITIVITY,
-            );
+        if self.engine.state() != EngineState::Running {
+            event_loop.exit();
+            return;
         }
-        let forward = self.input.is_key_down(KeyCode::KeyW) as u8 as f32
-            - self.input.is_key_down(KeyCode::KeyS) as u8 as f32;
-        let right = self.input.is_key_down(KeyCode::KeyD) as u8 as f32
-            - self.input.is_key_down(KeyCode::KeyA) as u8 as f32;
-        let vertical = self.input.is_key_down(KeyCode::Space) as u8 as f32
-            - (self.input.is_key_down(KeyCode::ShiftLeft)
-                || self.input.is_key_down(KeyCode::ShiftRight)) as u8 as f32;
-        self.camera
-            .move_local(forward, right, vertical, delta_seconds);
+        let input = self.engine.input();
+        let forward = input.is_active(MOVE_FORWARD) as u8 as f32
+            - input.is_active(MOVE_BACKWARD) as u8 as f32;
+        let right =
+            input.is_active(MOVE_RIGHT) as u8 as f32 - input.is_active(MOVE_LEFT) as u8 as f32;
+        let descending = is_descending(input);
+        let vertical = input.is_active(MOVE_UP) as u8 as f32 - descending as u8 as f32;
+        let [mouse_x, mouse_y] = self.engine.input_mut().take_pointer_delta();
+        let cursor_captured = self.cursor_captured;
+        let camera = &mut self.camera;
+        let schedule = match self.engine.run_frame(
+            Instant::now(),
+            |_| {},
+            |_| {},
+            |step| {
+                if cursor_captured {
+                    camera.rotate(
+                        (mouse_x as f32) * MOUSE_SENSITIVITY,
+                        (mouse_y as f32) * MOUSE_SENSITIVITY,
+                    );
+                }
+                camera.move_local(forward, right, vertical, step.delta.as_secs_f32());
+            },
+        ) {
+            Ok(schedule) => schedule,
+            Err(error) => {
+                self.fail_engine(event_loop, error);
+                return;
+            }
+        };
+        if self.engine.state() != EngineState::Running {
+            event_loop.exit();
+            return;
+        }
         let aspect_ratio = self
             .window
             .as_ref()
@@ -378,12 +473,17 @@ impl EngineApplication {
                     frames = self.frames_rendered,
                     "requested frame count reached"
                 );
+                if let Err(error) = self.engine.request_shutdown() {
+                    self.fail_engine(event_loop, error);
+                    return;
+                }
                 event_loop.exit();
             }
         }
 
-        if let Some(stats) =
-            frame_time.and_then(|frame_time| self.profiler.record(frame_time.delta, renderer_cpu))
+        if let Some(stats) = self
+            .profiler
+            .record(schedule.frame_time.delta, renderer_cpu)
         {
             debug!(
                 samples = stats.sample_count,
@@ -413,6 +513,10 @@ impl EngineApplication {
 
 impl Drop for EngineApplication {
     fn drop(&mut self) {
+        if matches!(self.engine.state(), EngineState::Running) {
+            let _ = self.engine.request_shutdown();
+        }
+        self.engine.shutdown();
         if self.cursor_captured {
             self.set_cursor_capture(false);
         }

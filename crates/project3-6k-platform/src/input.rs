@@ -1,82 +1,92 @@
-use std::collections::HashSet;
-
+use project3_6k_engine::{ActionId, EngineInput};
 use winit::keyboard::KeyCode;
 
-/// Current keyboard state, updated from native window events.
-#[derive(Debug, Default)]
-pub struct InputState {
-    keys_down: HashSet<KeyCode>,
-    mouse_delta: [f64; 2],
+pub(crate) const MOVE_FORWARD: ActionId = ActionId::new(1);
+pub(crate) const MOVE_BACKWARD: ActionId = ActionId::new(2);
+pub(crate) const MOVE_LEFT: ActionId = ActionId::new(3);
+pub(crate) const MOVE_RIGHT: ActionId = ActionId::new(4);
+pub(crate) const MOVE_UP: ActionId = ActionId::new(5);
+pub(crate) const MOVE_DOWN_LEFT_SHIFT: ActionId = ActionId::new(6);
+pub(crate) const CANCEL: ActionId = ActionId::new(7);
+pub(crate) const MOVE_DOWN_RIGHT_SHIFT: ActionId = ActionId::new(8);
+
+/// Maps native physical keys to logical engine actions used by the test app.
+pub(crate) fn action_for_key(key: KeyCode) -> Option<ActionId> {
+    match key {
+        KeyCode::KeyW => Some(MOVE_FORWARD),
+        KeyCode::KeyS => Some(MOVE_BACKWARD),
+        KeyCode::KeyA => Some(MOVE_LEFT),
+        KeyCode::KeyD => Some(MOVE_RIGHT),
+        KeyCode::Space => Some(MOVE_UP),
+        KeyCode::ShiftLeft => Some(MOVE_DOWN_LEFT_SHIFT),
+        KeyCode::ShiftRight => Some(MOVE_DOWN_RIGHT_SHIFT),
+        KeyCode::Escape => Some(CANCEL),
+        _ => None,
+    }
 }
 
-impl InputState {
-    /// Returns whether a physical key is currently held.
-    pub fn is_key_down(&self, key: KeyCode) -> bool {
-        self.keys_down.contains(&key)
-    }
-
-    /// Returns the number of currently held physical keys.
-    pub fn keys_down_count(&self) -> usize {
-        self.keys_down.len()
-    }
-
-    /// Returns and clears the accumulated raw mouse movement since the previous call.
-    pub fn take_mouse_delta(&mut self) -> [f64; 2] {
-        std::mem::take(&mut self.mouse_delta)
-    }
-
-    pub(crate) fn set_key_down(&mut self, key: KeyCode, is_down: bool) {
-        if is_down {
-            self.keys_down.insert(key);
-        } else {
-            self.keys_down.remove(&key);
-        }
-    }
-
-    pub(crate) fn add_mouse_motion(&mut self, delta: (f64, f64)) {
-        if delta.0.is_finite() && delta.1.is_finite() {
-            self.mouse_delta[0] += delta.0;
-            self.mouse_delta[1] += delta.1;
-        }
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.keys_down.clear();
-        self.mouse_delta = [0.0; 2];
-    }
+pub(crate) fn is_descending(input: &EngineInput) -> bool {
+    input.is_active(MOVE_DOWN_LEFT_SHIFT) || input.is_active(MOVE_DOWN_RIGHT_SHIFT)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use project3_6k_engine::{ActionId, EngineEvent, EngineRuntime};
+    use winit::keyboard::KeyCode;
+
+    use super::{
+        CANCEL, MOVE_DOWN_LEFT_SHIFT, MOVE_DOWN_RIGHT_SHIFT, MOVE_FORWARD, action_for_key,
+        is_descending,
+    };
 
     #[test]
-    fn tracks_key_press_release_and_focus_clear() {
-        let mut input = InputState::default();
-        input.set_key_down(KeyCode::KeyW, true);
-        input.set_key_down(KeyCode::KeyA, true);
-
-        assert!(input.is_key_down(KeyCode::KeyW));
-        assert_eq!(input.keys_down_count(), 2);
-
-        input.set_key_down(KeyCode::KeyW, false);
-        assert!(!input.is_key_down(KeyCode::KeyW));
-        assert!(input.is_key_down(KeyCode::KeyA));
-
-        input.clear();
-        assert_eq!(input.keys_down_count(), 0);
+    fn maps_native_keys_to_stable_logical_actions() {
+        assert_eq!(action_for_key(KeyCode::KeyW), Some(MOVE_FORWARD));
+        assert_eq!(
+            action_for_key(KeyCode::ShiftLeft),
+            Some(MOVE_DOWN_LEFT_SHIFT)
+        );
+        assert_eq!(
+            action_for_key(KeyCode::ShiftRight),
+            Some(MOVE_DOWN_RIGHT_SHIFT)
+        );
+        assert_eq!(action_for_key(KeyCode::Escape), Some(CANCEL));
+        assert_eq!(action_for_key(KeyCode::F12), None);
+        assert_eq!(MOVE_FORWARD, ActionId::new(1));
     }
 
     #[test]
-    fn accumulates_mouse_delta_until_read_and_clears_on_focus_loss() {
-        let mut input = InputState::default();
-        input.add_mouse_motion((2.5, -1.0));
-        input.add_mouse_motion((0.5, 3.0));
-        assert_eq!(input.take_mouse_delta(), [3.0, 2.0]);
-        assert_eq!(input.take_mouse_delta(), [0.0, 0.0]);
+    fn releasing_one_shift_key_keeps_descent_active_while_the_other_is_held() {
+        let mut engine = EngineRuntime::default();
+        engine.start().unwrap();
+        engine
+            .queue_event(EngineEvent::ActionChanged {
+                action: MOVE_DOWN_LEFT_SHIFT,
+                pressed: true,
+            })
+            .unwrap();
+        engine
+            .queue_event(EngineEvent::ActionChanged {
+                action: MOVE_DOWN_RIGHT_SHIFT,
+                pressed: true,
+            })
+            .unwrap();
+        engine
+            .queue_event(EngineEvent::ActionChanged {
+                action: MOVE_DOWN_LEFT_SHIFT,
+                pressed: false,
+            })
+            .unwrap();
 
-        input.add_mouse_motion((4.0, 5.0));
-        input.clear();
-        assert_eq!(input.take_mouse_delta(), [0.0, 0.0]);
+        assert!(is_descending(engine.input()));
+
+        engine
+            .queue_event(EngineEvent::ActionChanged {
+                action: MOVE_DOWN_RIGHT_SHIFT,
+                pressed: false,
+            })
+            .unwrap();
+        assert!(!is_descending(engine.input()));
+        engine.shutdown();
     }
 }

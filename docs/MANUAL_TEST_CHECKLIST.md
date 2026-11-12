@@ -2,6 +2,15 @@
 
 Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automated Vulkan checks are recorded in `target/validation-runs/` and are not a substitute for the checks below.
 
+## Phase 2 Engine Core
+
+- `cargo test -p project3-6k-engine` verifies lifecycle transitions, FIFO event dispatch, bounded queues, logical action state, focus-loss clearing, fixed-step catch-up limits, clamped variable delta, and deterministic frame timing.
+- `cargo test -p project3-6k-engine --test lifecycle_flow` verifies the host sequence: start → event → fixed update → variable update → render → shutdown.
+- `cargo run --release -p project3-6k-app -- --run-frames 5 --validation` verifies native startup, five submitted frames, orderly shutdown, and a clean Vulkan validation report.
+- `cargo run --release -p project3-6k-app -- --run-frames 180 --resize-stress --validation` automatically resizes, minimizes, restores, and exits after 180 submitted frames; verify it reports resize events, at least one zero extent, and zero Vulkan validation warnings/errors.
+- **NOT VERIFIED BY AUTOMATION** — Run `cargo run --release -p project3-6k-app -- --validation`, left-click to capture the cursor, then use W/A/S/D, Space, either Shift key, and mouse look. Press Escape once to release the cursor and again to close. Repeat with both Shift keys held and release them one at a time; vertical descent should continue until both are released.
+- **NOT VERIFIED BY AUTOMATION** — While the app is focused, resize it manually and minimize/restore it; confirm it resumes drawing and remains responsive. A hitch during resize can occur because the existing Vulkan scene is reconstructed on swapchain resize; this is tracked for a later rendering/resource phase.
+
 ## Phase 4a CPU asset pipeline
 
 - `cargo test -p project3-6k-assets` verifies synthetic glTF/GLB fixtures and imports the five curated Poly Haven glTF models from `assets/reference_scene/polyhaven/`, including their external JPEG PBR maps.

@@ -1,0 +1,11 @@
+[package]
+name = "project3-6k-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+project3-6k-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

@@ -1119,10 +1119,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "project3-6k-engine"
+version = "0.1.0"
+dependencies = [
+ "project3-6k-core",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "project3-6k-platform"
 version = "0.1.0"
 dependencies = [
  "project3-6k-core",
+ "project3-6k-engine",
  "project3-6k-vulkan",
  "thiserror 2.0.21",
  "tracing",
