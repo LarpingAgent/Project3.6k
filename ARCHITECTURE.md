@@ -15,8 +15,8 @@ flowchart TD
     Platform --> Window[Native window]
     Vulkan --> Surface[Window surface]
     Vulkan --> GPU[Graphics and presentation queue]
-    GPU --> Assets[Bounded GPU model/material cache]
-    Assets --> Swapchain[Acquire → PBR scene → submit → present]
+    GPU --> GpuCache[Bounded GPU model/material cache]
+    GpuCache --> Swapchain[Acquire → PBR scene → FP16 HDR → ACES tone map → present]
 ```
 
 ## Crate responsibilities and dependencies
@@ -50,4 +50,4 @@ Gameplay state should remain separate from rendering and native input. Future ne
 
 ## Current limits
 
-The renderer now draws a technical scene with CC0 external glTF models and ground textures. The CPU asset crate imports bounded static glTF 2.0/GLB geometry, node transforms, raster images, and PBR maps. Vulkan owns a bounded GPU model cache, texture-role-correct mip chains, directional GGX PBR, normal mapping, and alpha-masked materials. The scene is still sparse and has no true FP16 HDR target, dedicated tone mapper, cast shadows, atmospheric fog, material blending, or streaming. Visual quality must be checked from rendered pixels, not compilation results. See [the renderer pipeline](docs/rendering/vulkan-pipeline.md) and [Decision 0015](docs/decisions/0015-vulkan-pbr-foundation.md).
+The renderer now draws a technical scene with CC0 external glTF models and ground textures. The CPU asset crate imports bounded static glTF 2.0/GLB geometry, node transforms, raster images, and PBR maps. Vulkan owns a bounded GPU model cache, texture-role-correct mip chains, directional GGX PBR, normal mapping, alpha-masked materials, per-image FP16 HDR targets, and a separate ACES tone-mapping pass. The scene is still sparse and has no cast shadows, atmospheric fog, material blending, or streaming. Visual quality must be checked from rendered pixels, not compilation results. See [the renderer pipeline](docs/rendering/vulkan-pipeline.md), [Decision 0015](docs/decisions/0015-vulkan-pbr-foundation.md), and [Decision 0016](docs/decisions/0016-fp16-hdr-tone-mapping.md).

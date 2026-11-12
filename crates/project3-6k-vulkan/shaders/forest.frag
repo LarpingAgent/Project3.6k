@@ -97,9 +97,5 @@ void main() {
     vec3 ambient = scene.ambient_color.rgb * hemi * base.rgb * ao;
     vec3 emissive = texture(emissive_map, texture_uv).rgb * material.emissive_factor.rgb;
     vec3 hdr_color = direct + ambient + emissive;
-
-    // Temporary display transform for the current LDR swapchain. The next renderer stage moves
-    // this transform to a full-resolution FP16 HDR target and a dedicated post-process pass.
-    vec3 mapped = hdr_color / (hdr_color + vec3(1.0));
-    out_color = vec4(mapped, base.a);
+    out_color = vec4(max(hdr_color, vec3(0.0)), base.a);
 }

@@ -20,7 +20,8 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 - `cargo clippy --workspace --all-targets -- -D warnings` checks all workspace targets without warnings.
 - `cargo run -p project3-6k-app -- --run-frames 5 --validation --capture-frame artifacts/visual-verification/current.png` opens the application, imports and uploads the external models/maps, renders, captures one swapchain frame, validates, and exits.
 - **VERIFIED** — [pbr-foundation-stage-3.png](../artifacts/visual-verification/pbr-foundation-stage-3.png) was captured from the running Vulkan application and opened at 1280×720. The floor, stump, rocks, upright trunk, foliage, PBR map response, and directional light are visible.
-- **NOT VERIFIED / NOT IMPLEMENTED** — The PBR screenshot has no cast shadows. True floating-point HDR rendering and a separate tone-mapping pass are not implemented yet; the current shader only applies a temporary display transform.
+- **VERIFIED** — [hdr-stage-1.png](../artifacts/visual-verification/hdr-stage-1.png) was captured from the native Vulkan application after rendering to an FP16 target and running the separate ACES tone-mapping pass. `--validation` completed with exit code 0.
+- **NOT VERIFIED / NOT IMPLEMENTED** — The HDR screenshot has no cast shadows or atmospheric fog; a shadow-map pass and further visual verification are still required.
 - **NOT VERIFIED BY AUTOMATION** — Check the technical scene on a second Vulkan GPU, inspect foliage alpha edges and texture tiling at multiple distances, and compare a capture after FP16 HDR and shadow-map work.
 
 ## Phase 2 application and window lifecycle

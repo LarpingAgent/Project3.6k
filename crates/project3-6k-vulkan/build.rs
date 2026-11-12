@@ -14,7 +14,7 @@ fn main() {
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets this"));
     let output_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets this"));
-    for shader in ["forest.vert", "forest.frag"] {
+    for shader in ["forest.vert", "forest.frag", "tonemap.vert", "tonemap.frag"] {
         let source = manifest_dir.join("shaders").join(shader);
         let output = output_dir.join(format!("{shader}.spv"));
         println!("cargo:rerun-if-changed={}", source.display());

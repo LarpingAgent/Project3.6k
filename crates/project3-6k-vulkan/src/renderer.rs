@@ -24,9 +24,15 @@ mod forest_scene;
 mod gpu_asset_cache;
 #[path = "gpu_resources.rs"]
 mod gpu_resources;
+#[path = "hdr_target.rs"]
+mod hdr_target;
+#[path = "tone_map.rs"]
+mod tone_map;
 
 use depth_buffer::{DepthAttachment, choose_depth_format};
 use forest_scene::ForestScene;
+use hdr_target::HdrTarget;
+use tone_map::ToneMapPass;
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 const DEBUG_UTILS_EXTENSION: &CStr = c"VK_EXT_debug_utils";
@@ -53,6 +59,8 @@ pub enum VulkanRendererError {
     UnsupportedSurfaceUsage,
     #[error("the selected Vulkan device has no supported depth attachment format")]
     NoSupportedDepthFormat,
+    #[error("the selected Vulkan device has no filterable FP16 color-attachment format for HDR")]
+    NoSupportedHdrFormat,
     #[error("the selected Vulkan device has no linearly-filterable sRGB texture format")]
     NoSupportedTextureFormat,
     #[error("the selected Vulkan device has no linearly-filterable RGBA8 data texture format")]
@@ -126,6 +134,8 @@ pub enum VulkanRendererError {
     UnsupportedTextureCoordinates(u32),
     #[error("GPU renderer does not yet support alpha-blended glTF materials")]
     UnsupportedBlendMaterial,
+    #[error("the tone-mapping pass received no HDR targets")]
+    InvalidToneMapTargets,
 }
 
 type Result<T> = std::result::Result<T, VulkanRendererError>;
@@ -415,15 +425,20 @@ struct SwapchainState {
     device: ash::Device,
     swapchain: vk::SwapchainKHR,
     format: vk::Format,
+    hdr_format: vk::Format,
     depth_format: vk::Format,
     extent: vk::Extent2D,
     readback_supported: bool,
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
-    render_pass: vk::RenderPass,
+    hdr_render_pass: vk::RenderPass,
+    present_render_pass: vk::RenderPass,
     depth_images: Vec<DepthAttachment>,
+    hdr_targets: Vec<HdrTarget>,
     forest_scene: Option<ForestScene>,
-    framebuffers: Vec<vk::Framebuffer>,
+    tone_map: Option<ToneMapPass>,
+    hdr_framebuffers: Vec<vk::Framebuffer>,
+    present_framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
     frames: Vec<FrameSync>,
@@ -448,15 +463,20 @@ impl SwapchainState {
             device,
             swapchain: vk::SwapchainKHR::null(),
             format: vk::Format::UNDEFINED,
+            hdr_format: vk::Format::UNDEFINED,
             depth_format: vk::Format::UNDEFINED,
             extent: vk::Extent2D::default(),
             readback_supported: false,
             images: Vec::new(),
             image_views: Vec::new(),
-            render_pass: vk::RenderPass::null(),
+            hdr_render_pass: vk::RenderPass::null(),
+            present_render_pass: vk::RenderPass::null(),
             depth_images: Vec::new(),
+            hdr_targets: Vec::new(),
             forest_scene: None,
-            framebuffers: Vec::new(),
+            tone_map: None,
+            hdr_framebuffers: Vec::new(),
+            present_framebuffers: Vec::new(),
             command_pool: vk::CommandPool::null(),
             command_buffers: Vec::new(),
             frames: Vec::new(),
@@ -536,7 +556,10 @@ impl SwapchainState {
         // SAFETY: The new swapchain is live and owned by this state.
         self.images = unsafe { self.loader.get_swapchain_images(self.swapchain)? };
 
-        self.render_pass = create_render_pass(&self.device, self.format, self.depth_format)?;
+        self.hdr_format = choose_hdr_format(&context.instance, context.physical_device)?;
+        self.hdr_render_pass =
+            create_hdr_render_pass(&self.device, self.hdr_format, self.depth_format)?;
+        self.present_render_pass = create_present_render_pass(&self.device, self.format)?;
         // SAFETY: The physical device belongs to the live Vulkan instance.
         let memory_properties = unsafe {
             context
@@ -553,11 +576,17 @@ impl SwapchainState {
                 self.extent,
                 self.depth_format,
             )?);
+            self.hdr_targets.push(HdrTarget::new(
+                &self.device,
+                &memory_properties,
+                self.extent,
+                self.hdr_format,
+            )?);
         }
         self.forest_scene = Some(ForestScene::new(
             &self.device,
             &memory_properties,
-            self.render_pass,
+            self.hdr_render_pass,
             context.graphics_queue,
             context.queue_family_index,
             texture_format,
@@ -580,18 +609,40 @@ impl SwapchainState {
             self.image_views
                 .push(unsafe { self.device.create_image_view(&view_info, None)? });
         }
-        for (image_view, depth_image) in self.image_views.iter().zip(&self.depth_images) {
-            let attachments = [*image_view, depth_image.view];
+        for (hdr_target, depth_image) in self.hdr_targets.iter().zip(&self.depth_images) {
+            let attachments = [hdr_target.view, depth_image.view];
             let framebuffer_info = vk::FramebufferCreateInfo::default()
-                .render_pass(self.render_pass)
+                .render_pass(self.hdr_render_pass)
                 .attachments(&attachments)
                 .width(self.extent.width)
                 .height(self.extent.height)
                 .layers(1);
             // SAFETY: The image view is compatible with the render pass and extent.
-            self.framebuffers
+            self.hdr_framebuffers
                 .push(unsafe { self.device.create_framebuffer(&framebuffer_info, None)? });
         }
+        for image_view in &self.image_views {
+            let attachments = [*image_view];
+            let framebuffer_info = vk::FramebufferCreateInfo::default()
+                .render_pass(self.present_render_pass)
+                .attachments(&attachments)
+                .width(self.extent.width)
+                .height(self.extent.height)
+                .layers(1);
+            // SAFETY: The swapchain image view is compatible with the one-color presentation pass.
+            self.present_framebuffers
+                .push(unsafe { self.device.create_framebuffer(&framebuffer_info, None)? });
+        }
+        self.tone_map = Some(ToneMapPass::new(
+            &self.device,
+            self.present_render_pass,
+            &self
+                .hdr_targets
+                .iter()
+                .map(|target| target.view)
+                .collect::<Vec<_>>(),
+            self.format,
+        )?);
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(context.queue_family_index)
@@ -718,16 +769,22 @@ impl SwapchainState {
             &self.device,
             command_buffer,
             ScenePassTarget {
-                render_pass: self.render_pass,
-                framebuffer: self.framebuffers[image_index],
+                hdr_render_pass: self.hdr_render_pass,
+                hdr_framebuffer: self.hdr_framebuffers[image_index],
+                present_render_pass: self.present_render_pass,
+                present_framebuffer: self.present_framebuffers[image_index],
                 swapchain_image: self.images[image_index],
                 readback_buffer: readback_buffer.as_ref().map(|buffer| buffer.buffer),
+                frame_index: self.current_frame,
+                image_index,
             },
             self.extent,
             self.forest_scene
                 .as_ref()
-                .expect("forest scene is initialized with the render pass"),
-            self.current_frame,
+                .expect("forest scene is initialized with the HDR render pass"),
+            self.tone_map
+                .as_ref()
+                .expect("tone-mapping pass is initialized with the swapchain"),
         )?;
 
         // SAFETY: Reset only after the current frame's previous work has completed.
@@ -825,17 +882,27 @@ impl SwapchainState {
                 self.command_pool = vk::CommandPool::null();
             }
             self.command_buffers.clear();
-            for framebuffer in self.framebuffers.drain(..).rev() {
+            for framebuffer in self.present_framebuffers.drain(..).rev() {
                 self.device.destroy_framebuffer(framebuffer, None);
             }
+            for framebuffer in self.hdr_framebuffers.drain(..).rev() {
+                self.device.destroy_framebuffer(framebuffer, None);
+            }
+            self.tone_map.take();
             self.forest_scene.take();
+            self.hdr_targets.clear();
             self.depth_images.clear();
             for image_view in self.image_views.drain(..).rev() {
                 self.device.destroy_image_view(image_view, None);
             }
-            if self.render_pass != vk::RenderPass::null() {
-                self.device.destroy_render_pass(self.render_pass, None);
-                self.render_pass = vk::RenderPass::null();
+            if self.present_render_pass != vk::RenderPass::null() {
+                self.device
+                    .destroy_render_pass(self.present_render_pass, None);
+                self.present_render_pass = vk::RenderPass::null();
+            }
+            if self.hdr_render_pass != vk::RenderPass::null() {
+                self.device.destroy_render_pass(self.hdr_render_pass, None);
+                self.hdr_render_pass = vk::RenderPass::null();
             }
             if self.swapchain != vk::SwapchainKHR::null() {
                 self.loader.destroy_swapchain(self.swapchain, None);
@@ -989,6 +1056,24 @@ fn choose_texture_format(
     }
 }
 
+fn choose_hdr_format(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<vk::Format> {
+    let format = vk::Format::R16G16B16A16_SFLOAT;
+    // SAFETY: The physical device belongs to the live Vulkan instance.
+    let properties =
+        unsafe { instance.get_physical_device_format_properties(physical_device, format) };
+    let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+    if properties.optimal_tiling_features.contains(required) {
+        Ok(format)
+    } else {
+        Err(VulkanRendererError::NoSupportedHdrFormat)
+    }
+}
+
 fn choose_linear_texture_format(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -1061,21 +1146,21 @@ fn choose_composite_alpha(supported: vk::CompositeAlphaFlagsKHR) -> vk::Composit
     .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE)
 }
 
-fn create_render_pass(
+fn create_hdr_render_pass(
     device: &ash::Device,
-    format: vk::Format,
+    hdr_format: vk::Format,
     depth_format: vk::Format,
 ) -> Result<vk::RenderPass> {
     let attachments = [
         vk::AttachmentDescription::default()
-            .format(format)
+            .format(hdr_format)
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+            .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
         vk::AttachmentDescription::default()
             .format(depth_format)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -1117,10 +1202,13 @@ fn create_render_pass(
         vk::SubpassDependency::default()
             .src_subpass(0)
             .dst_subpass(vk::SUBPASS_EXTERNAL)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+            .src_stage_mask(
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            )
+            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+            .dst_access_mask(vk::AccessFlags::SHADER_READ),
     ];
     let info = vk::RenderPassCreateInfo::default()
         .attachments(&attachments)
@@ -1130,11 +1218,55 @@ fn create_render_pass(
     Ok(unsafe { device.create_render_pass(&info, None)? })
 }
 
+fn create_present_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::RenderPass> {
+    let attachments = [vk::AttachmentDescription::default()
+        .format(format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+    let color = [vk::AttachmentReference {
+        attachment: 0,
+        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+    }];
+    let subpasses = [vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color)];
+    let dependencies = [
+        vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+        vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+    ];
+    let info = vk::RenderPassCreateInfo::default()
+        .attachments(&attachments)
+        .subpasses(&subpasses)
+        .dependencies(&dependencies);
+    // SAFETY: The pass contains one sampled-tone-mapped swapchain color attachment.
+    Ok(unsafe { device.create_render_pass(&info, None)? })
+}
+
 struct ScenePassTarget {
-    render_pass: vk::RenderPass,
-    framebuffer: vk::Framebuffer,
+    hdr_render_pass: vk::RenderPass,
+    hdr_framebuffer: vk::Framebuffer,
+    present_render_pass: vk::RenderPass,
+    present_framebuffer: vk::Framebuffer,
     swapchain_image: vk::Image,
     readback_buffer: Option<vk::Buffer>,
+    frame_index: usize,
+    image_index: usize,
 }
 
 fn record_scene_pass(
@@ -1143,7 +1275,7 @@ fn record_scene_pass(
     target: ScenePassTarget,
     extent: vk::Extent2D,
     scene: &ForestScene,
-    frame_index: usize,
+    tone_map: &ToneMapPass,
 ) -> Result<()> {
     // SAFETY: This command buffer is owned by the graphics command pool and is not in flight.
     unsafe {
@@ -1154,7 +1286,7 @@ fn record_scene_pass(
         let clear_values = [
             vk::ClearValue {
                 color: vk::ClearColorValue {
-                    float32: [0.025, 0.055, 0.035, 1.0],
+                    float32: [0.04, 0.075, 0.06, 1.0],
                 },
             },
             vk::ClearValue {
@@ -1165,8 +1297,8 @@ fn record_scene_pass(
             },
         ];
         let render_pass_info = vk::RenderPassBeginInfo::default()
-            .render_pass(target.render_pass)
-            .framebuffer(target.framebuffer)
+            .render_pass(target.hdr_render_pass)
+            .framebuffer(target.hdr_framebuffer)
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent,
@@ -1177,7 +1309,23 @@ fn record_scene_pass(
             &render_pass_info,
             vk::SubpassContents::INLINE,
         );
-        scene.record_draw(command_buffer, extent, frame_index);
+        scene.record_draw(command_buffer, extent, target.frame_index);
+        device.cmd_end_render_pass(command_buffer);
+        let present_clear = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        }];
+        let present_info = vk::RenderPassBeginInfo::default()
+            .render_pass(target.present_render_pass)
+            .framebuffer(target.present_framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent,
+            })
+            .clear_values(&present_clear);
+        device.cmd_begin_render_pass(command_buffer, &present_info, vk::SubpassContents::INLINE);
+        tone_map.record_draw(command_buffer, extent, target.image_index);
         device.cmd_end_render_pass(command_buffer);
         if let Some(readback_buffer) = target.readback_buffer {
             let to_transfer = [vk::ImageMemoryBarrier::default()
