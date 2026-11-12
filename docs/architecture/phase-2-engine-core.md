@@ -1,6 +1,6 @@
 # Phase 2 — Engine Core Implementation Report
 
-- **Status:** Acceptance checks passed on `codex/rendering-asset-foundation`.
+- **Status:** Implementation checks passed; focused closure review is in [Phase 2 Verification](phase-2-verification.md).
 - **Scope:** lifecycle, event translation/dispatch, logical input, time/update scheduling, engine configuration/errors, and orderly host shutdown.
 - **Architecture review:** [Phase 1 review](phase-1-architecture-review.md).
 
@@ -28,7 +28,7 @@
 | Cargo dependency graph | `cargo metadata --no-deps` plus workspace-member graph traversal confirmed `app → platform → engine → core`, `platform → vulkan → assets/core`, with no cycles. Engine has no Platform/Vulkan dependency. |
 | Lifecycle/event/update/render/shutdown | `cargo test -p project3-6k-engine --test lifecycle_flow`: passed. The test asserts start → FIFO event dispatch → fixed updates → variable update → host render → shutdown. |
 | Deterministic behavior | Unit tests cover lifecycle transitions, bounded queue, input/focus clearing, frame-delta clamp, fixed-step cap, interpolation, event order, and invalid config. Platform test covers both Shift keys held and released separately. |
-| Full workspace tests | `cargo test --workspace`: **60 passed, 0 failed**. |
+| Full workspace tests | `cargo test --workspace`: **61 passed, 0 failed** in the focused closure review. |
 | Lint and build | `cargo clippy --workspace --all-targets -- -D warnings` and `cargo build --release -p project3-6k-app`: passed. `cargo fmt --all -- --check`: passed. |
 | Native runtime | Release `--run-frames 180 --validation`: 180 frames submitted, clean shutdown, 0 Vulkan validation warnings/errors. Three additional Release `--auto-close --validation` runs also started/stopped cleanly with 0 warnings/errors each. |
 | Resize/minimize/restore | Release `--run-frames 180 --resize-stress --validation`: exited 0; 8 resize events including one zero extent; restored and completed all 180 frames; 0 Vulkan validation warnings/errors. |
@@ -45,4 +45,4 @@ The resize stress run exposed the existing renderer behavior documented in Phase
 
 No new screenshot was captured because Phase 2 made no rendering or visual-scene changes. The existing [Phase 0 baseline capture](../../artifacts/visual-verification/phase0-baseline.png) remains the renderer reference.
 
-Phase 2 is complete. The next roadmap phase is Phase 3 — Entity & World Architecture; it should be started as a separate scoped task.
+The Engine Core implementation is complete. Phase 2 closure awaits explicit user confirmation after the focused [verification review](phase-2-verification.md). Do not start Phase 3 before that confirmation.

@@ -1,6 +1,6 @@
 # Current architecture overview
 
-This document describes the committed implementation, not the target architecture. The evidence-based audit is [Phase 0 — Foundation Audit](foundation-audit.md), the completed engine-core work is [Phase 2 — Engine Core](phase-2-engine-core.md), and the full phase-based target is [Master Engine Architecture](master-architecture.md).
+This document describes the committed implementation, not the target architecture. The evidence-based audit is [Phase 0 — Foundation Audit](foundation-audit.md), the Engine Core implementation is [Phase 2 — Engine Core](phase-2-engine-core.md), and its closure findings are in [Phase 2 Verification](phase-2-verification.md). The full phase-based target is [Master Engine Architecture](master-architecture.md).
 
 ## Current crate graph
 
