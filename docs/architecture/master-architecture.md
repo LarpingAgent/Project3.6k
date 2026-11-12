@@ -1,7 +1,7 @@
 # Project3.6k — Master Engine Architecture
 
-- **Status:** Phase 1 architecture proposal; design only.
-- **Baseline:** commit `d3b21b628bb4714a70fd75ae9f77b5633ceba810`, audited in [Phase 0](foundation-audit.md).
+- **Status:** Phase 1 architecture reviewed; Phase 2 implementation is in progress.
+- **Baseline:** source commit `d3b21b628bb4714a70fd75ae9f77b5633ceba810`, audited in [Phase 0](foundation-audit.md); boundary review in [Phase 1 Review](phase-1-architecture-review.md).
 - **Rule:** proposed modules and boundaries below are not implemented until their phase starts and its acceptance criteria are agreed.
 
 ## 1. Architecture goals and constraints
@@ -14,6 +14,7 @@ Project3.6k is intended to support a realistic open-world game over multiple pha
 - Do not implement gameplay, terrain generation, ECS, or new rendering features during Phases 0–1.
 - Keep `project3-6k-assets` free of Vulkan types and handles.
 - Keep Vulkan resource creation, submission, synchronization, and destruction in the rendering backend.
+- Keep the native event pump in the platform adapter. The engine core consumes platform-neutral events and provides lifecycle/time/update scheduling without depending on `winit`.
 - Never put raw pointers, borrowed file buffers, or Vulkan handles in ECS components or cross-thread messages.
 - Require evidence before introducing a new crate, job system, allocator, render graph, or abstraction layer.
 
@@ -21,9 +22,9 @@ Project3.6k is intended to support a realistic open-world game over multiple pha
 
 ```mermaid
 flowchart TB
-  App[project3-6k-app<br/>entry point + CLI/config selection]
-  Engine[project3-6k-engine<br/>lifecycle + orchestration]
-  Platform[project3-6k-platform<br/>window + OS events + input]
+  App[project3-6k-app<br/>entry point + CLI/logging setup]
+  Engine[project3-6k-engine<br/>lifecycle + events + time/update schedule]
+  Platform[project3-6k-platform<br/>winit host + input mapping + renderer host]
   Core[project3-6k-core<br/>IDs + math + time + shared errors]
   Assets[project3-6k-assets<br/>CPU import + registry + async decode]
   World[project3-6k-world<br/>ECS + transforms + scenes + spatial data]
@@ -33,25 +34,25 @@ flowchart TB
   Animation[project3-6k-animation-audio<br/>animation + audio services]
   Gameplay[project3-6k-gameplay<br/>game rules and features]
 
-  App --> Engine
-  App --> Vulkan
-  Engine --> Platform
+  App --> Platform
+  Platform --> Engine
+  Platform -. Phase 2 temporary host .-> Vulkan
   Engine --> Core
-  Engine --> Assets
-  Engine --> World
-  Engine --> RenderAPI
+  Platform --> Core
+  Vulkan --> Core
+  Vulkan --> Assets
+  Engine -. Phase 4+ .-> Assets
+  Engine -. Phase 3+ .-> World
+  Engine -. Phase 5 contract .-> RenderAPI
+  Vulkan -. Phase 5 .-> RenderAPI
   Engine -. later phases .-> Physics
   Engine -. later phases .-> Animation
   Engine -. later phases .-> Gameplay
-  Platform --> Core
   World --> Core
   World --> Assets
   World --> RenderAPI
   RenderAPI --> Core
   RenderAPI --> Assets
-  Vulkan --> RenderAPI
-  Vulkan --> Core
-  Vulkan --> Assets
   Physics --> Core
   Physics --> World
   Animation --> Core
@@ -62,15 +63,15 @@ flowchart TB
   Gameplay --> Assets
 ```
 
-`project3-6k-engine`, `project3-6k-world`, `project3-6k-render-api`, and later simulation/gameplay crates are **proposed only**. They should be introduced when their first concrete public boundary is ready. The app selects and supplies a renderer backend; the engine uses only the backend-neutral contract. World and gameplay never call `ash`.
+`project3-6k-engine` is introduced in Phase 2 with only the concrete lifecycle/event/time boundary; world, render-api, and later simulation/gameplay crates remain proposed until their phases. The current Platform → Vulkan composition edge is temporary. Phase 5 may move backend selection behind a renderer contract once the World render snapshot is defined. World and gameplay never call `ash`.
 
 ### Module responsibilities
 
 | Module | Owns | Must not own |
 |---|---|---|
-| App | executable arguments, logging setup, backend selection, process exit reporting | game loop details, Vulkan resources, world state |
-| Engine | startup/shutdown order, service construction, event/update/render schedule, configuration, top-level recovery | game rules, raw Vulkan resource lifetime |
-| Platform | native window, OS event translation, input device state, surface-capable handles | camera gameplay rules, ECS, Vulkan device, render passes |
+| App | executable arguments, tracing subscriber setup, process exit reporting | engine state, window loop details, Vulkan resources, world state |
+| Engine | lifecycle state, bounded platform-neutral events, logical action input, time/fixed+variable update schedule, engine config/errors | `winit`, native window, camera policy, renderer selection, raw Vulkan resource lifetime |
+| Platform | native event loop/window, OS-to-engine event translation, physical input mapping, camera controller, temporary Vulkan composition | ECS, world ownership, asset decoding, Vulkan internals beyond calling the renderer API |
 | Core | entity/asset IDs where backend-neutral, math, time primitives, typed shared contracts | window, filesystem decoding, GPU handles, game-specific components |
 | Assets | source metadata, CPU decoding/validation/processing, CPU cache, async load requests/completions | `ash`, `vk::*`, graphics queues, render-pass state |
 | World | entity/component storage, transform hierarchy, scenes/worlds, spatial queries, asset references, render snapshot creation | Vulkan handles, file decoding, application event loop |
@@ -78,7 +79,7 @@ flowchart TB
 | Vulkan backend | device/swapchain, GPU asset cache, uploads, render passes, shaders, fences, readback | entity ownership, world mutation, inventory/combat rules |
 | Physics / Animation-Audio / Gameplay | their phase-specific simulation and rules | platform handles, direct Vulkan calls, asset file decoding |
 
-The present `project3-6k-platform` currently combines Platform, part of Engine, Camera, and direct Vulkan construction. Split those responsibilities only when Phase 2 introduces the engine lifecycle contract; do not do a mechanical crate rewrite in Phase 1.
+The present `project3-6k-platform` combines the native event loop, input, camera, frame clock/profiling, and direct Vulkan construction. Phase 2 extracts lifecycle, event dispatch, input state, and update scheduling into `project3-6k-engine`; the existing `winit` loop remains the host adapter and drives that engine API. The Platform → Vulkan edge is a temporary composition boundary until a backend-neutral renderer contract is justified in Phase 5. This keeps Phase 2 implementable without making Engine depend on `winit` or inventing a renderer API early.
 
 ## 3. Module dependency rules
 
@@ -87,40 +88,51 @@ The present `project3-6k-platform` currently combines Platform, part of Engine, 
 3. `assets` may depend on core IDs/math, but never on Vulkan or world.
 4. `world` depends on core and asset handles. It publishes immutable render data rather than GPU objects.
 5. `render-api` depends on core and asset handles only. The Vulkan backend implements it.
-6. `project3-6k-engine` depends on contracts and system facades, not on `project3-6k-vulkan` concrete types.
-7. The executable links the selected backend. Gameplay depends on world/core/services and cannot depend on Vulkan.
+6. `project3-6k-engine` depends on `project3-6k-core` and small shared utility crates only. It must not depend on `winit`, `project3-6k-platform`, or `project3-6k-vulkan`.
+7. The executable uses the platform host in Phase 2. Backend selection can move to app/engine only after Phase 5 defines a concrete backend-neutral contract. Gameplay depends on world/core/services and cannot depend on Vulkan.
 8. Avoid a new crate when an internal module is enough; extraction requires two real consumers, a cycle-prevention need, or a material compile/API boundary.
 
-### Target dependency graph
+During Phase 2, `project3-6k-platform` depends on `project3-6k-engine` to adapt OS events and drive engine ticks. This dependency direction is intentional and acyclic. The direct platform-to-Vulkan construction remains temporary; changing that edge requires a concrete renderer contract and belongs to Phase 5.
+
+### Phase 2 dependency graph
 
 ```mermaid
 flowchart LR
-  App[app] --> Engine[engine]
-  App --> Vulkan[vulkan backend selection]
-  Engine --> Platform[platform]
-  Engine --> World[world]
-  Engine --> Assets[assets]
-  Engine --> RenderAPI[render-api]
-  World --> Core[core]
-  World --> Assets
-  World --> RenderAPI
+  App[app] --> Platform[platform adapter]
+  Platform --> Engine[engine core]
+  Platform -. temporary renderer host .-> Vulkan[vulkan]
+  Engine --> Core[core]
+  Platform --> Core
+  Vulkan --> Core
+  Vulkan --> Assets[assets]
+  Engine -. Phase 3+ .-> World[world]
+  Engine -. Phase 4+ .-> Assets
+  Engine -. Phase 5 contract .-> RenderAPI[render-api]
+  Vulkan -. Phase 5 .-> RenderAPI
   RenderAPI --> Core
   RenderAPI --> Assets
-  Vulkan --> RenderAPI
-  Vulkan --> Assets
-  Vulkan --> Core
+  World --> Core
+  World --> Assets
+  World --> RenderAPI
   Gameplay[gameplay] --> World
   Gameplay --> Core
   Physics[physics] --> World
   Physics --> Core
 ```
 
-The existing dependency graph is recorded separately in [module-dependencies.md](module-dependencies.md); this diagram is the target, not a claim about current source.
+This graph records the Phase 2 dependency direction and future edges without implying the future crates already exist. The platform-to-Vulkan edge is marked temporary. The actual graph is recorded separately in [module-dependencies.md](module-dependencies.md).
 
 ## 4. Data flow
 
 ```mermaid
 flowchart LR
+  OS[OS / winit event] --> Platform[Platform adapter]
+  Platform -->|platform-neutral event| Engine[Engine event queue]
+  Engine -->|fixed + variable update callbacks| Platform
+  Platform -->|current technical scene render| Vulkan[Vulkan renderer]
+  World[Phase 3 World] --> Snapshot[immutable RenderSnapshot]
+  Snapshot -. Phase 5 contract .-> RenderAPI[render-api]
+  RenderAPI -. Phase 5 .-> Vulkan
   Files[glTF/GLB + images + audio] --> Request[Asset request / stable handle]
   Request --> Queue[bounded CPU load queue]
   Queue --> Worker[CPU decode + validate + process]
@@ -128,8 +140,7 @@ flowchart LR
   Complete --> Registry[CPU Asset Registry / budgeted cache]
   Registry --> World[World components store handles]
   World --> Snapshot[immutable RenderSnapshot]
-  Snapshot --> Engine[Engine frame schedule]
-  Engine --> Backend[renderer backend]
+  Snapshot --> RenderAPI
   Registry --> Upload[render-thread GPU upload request]
   Upload --> GpuCache[GPU cache + RAII resources]
   GpuCache --> Backend
@@ -150,10 +161,10 @@ Rules:
 
 ```mermaid
 flowchart TB
-  App[App owns Engine]
-  Engine[Engine owns Platform + AssetRegistry + World + Renderer contract]
-  Platform[Platform owns Window + native input state]
-  Cpu[AssetRegistry owns CPU assets + budget]
+  App[App owns Platform host]
+  Engine[Engine owns lifecycle + event queue + time scheduler + input state]
+  Platform[Platform owns Window + event loop + VulkanRenderer]
+  Cpu[Phase 4 AssetRegistry owns CPU assets + budget]
   Worker[Asset worker owns temporary decode buffers]
   World[World owns Entity/Component storage; components hold AssetHandles]
   Snapshot[frame-scoped immutable RenderSnapshot]
@@ -161,11 +172,10 @@ flowchart TB
   GpuCache[GPU cache owns buffers/images/samplers + RAII wrappers]
   InFlight[submitted frame owns references until its fence signals]
 
-  App --> Engine
-  Engine --> Platform
-  Engine --> Cpu
-  Engine --> World
-  Engine --> Backend
+  Platform --> Engine
+  Engine -. Phase 4+ .-> Cpu
+  Engine -. Phase 3+ .-> World
+  Platform --> Backend
   Worker -->|owned result or error| Cpu
   World --> Snapshot
   Snapshot -->|copied IDs/handles| Backend
@@ -207,7 +217,7 @@ sequenceDiagram
 
 | Thread | Responsibility | Ownership restrictions |
 |---|---|---|
-| Main/event thread | window events, engine schedule, fixed update ticks, render snapshot, Vulkan recording/submission initially | sole writer of live World and Vulkan objects in the first implementation |
+| Main/event thread | window events, platform-neutral event dispatch, engine fixed/variable update schedule, Vulkan recording/submission initially | sole writer of Engine state, live World when added, and Vulkan objects in the first implementation |
 | CPU asset workers | file read, CPU decode, validation, mesh/texture processing | return owned messages only; never mutate World/registry or touch Vulkan |
 | GPU/presentation execution | executes submitted command buffers asynchronously | synchronization and lifetime are expressed by backend fences/semaphores |
 | Validation callback | driver diagnostics on implementation-selected thread | atomic summary and bounded owned messages; no renderer mutation |
@@ -272,7 +282,7 @@ crates/
   project3-6k-platform/            # current: winit event loop/input; later OS adapter only
   project3-6k-assets/              # current: CPU model/texture/HDR import and caches
   project3-6k-vulkan/              # current: Vulkan backend and static ForestScene
-  project3-6k-engine/              # proposed in Phase 2: lifecycle and orchestration
+  project3-6k-engine/              # Phase 2: lifecycle, bounded events, input actions, time/update schedule
   project3-6k-world/               # proposed in Phase 3: ECS, World, spatial data
   project3-6k-render-api/          # proposed in Phase 5 only if a backend-neutral contract is needed
   project3-6k-physics/             # proposed in Phase 7
@@ -296,8 +306,8 @@ This is a target organization, not an instruction to create empty crates or move
 | Phase | Scope and outputs | Acceptance criteria / gate |
 |---|---|---|
 | 0 — Foundation Audit | Current crates/modules, dependencies, actual/prototype/missing systems, ownership, performance, build/tests/validation; audit report | Evidence linked to current source and runtime; current architecture diagram; findings and priorities. **Complete in `foundation-audit.md`.** |
-| 1 — Master Architecture | Module responsibilities/dependencies, data flow, memory ownership, threading, ECS, render, assets, world, errors, tests, directory layout, phase contracts | All requested diagrams and boundaries written down; current-vs-target distinction explicit; no code implementation. **Documented here; design review gate before Phase 2.** |
-| 2 — Engine Core | Engine/application lifecycle, event translation, time and fixed/variable update schedule, logging/config/error state, orderly shutdown | Start → event → fixed update → render → shutdown integration test; zero validation/lifetime errors; deterministic time tests; no resource leaks observed in repeated start/stop and resize runs. |
+| 1 — Master Architecture | Module responsibilities/dependencies, data flow, memory ownership, threading, ECS, render, assets, world, errors, tests, directory layout, phase contracts | All requested diagrams and boundaries written down; current-vs-target distinction explicit; no code implementation. **Review passed with a documented Phase 2 host-adapter correction; see [review](phase-1-architecture-review.md).** |
+| 2 — Engine Core | Engine/application lifecycle state, bounded platform-neutral event queue, action input abstraction, fixed/variable update schedule, engine config/error state, lifecycle logs; reuse existing `FrameClock`, app tracing setup, and platform `winit` loop | Start → OS event translation → engine event/update → render → orderly shutdown integration test; deterministic time/lifecycle/event tests; zero Vulkan validation/lifetime errors; no leaks observed in repeated start/stop and resize runs. |
 | 3 — Entity & World Architecture | Generation-safe entity IDs, component storage, systems, hierarchy transforms, Scene/World lifecycle, bounded spatial queries | Create/update/destroy and query at 100k-entity test scale; stale IDs rejected; memory and p50/p95 update/query timings recorded; no Vulkan dependency in World. |
 | 4 — Asset & Resource Architecture | Unified registry/metadata, static glTF/GLB and texture/material CPU assets, bounded async jobs, stable handles, CPU/GPU tier cache and unload | Load external model/material, deduplicate repeated loads, enforce budgets, report import errors, unload/reload while invalidating stale handles, and release GPU objects only after safe retirement. |
 | 5 — Rendering Architecture | Backend-neutral render snapshot, render pass/graph boundary, GPU ownership, PBR/HDR/shadows/IBL, culling, instancing, LOD integration | Renderer consumes snapshot/asset handles without gameplay types or Vulkan leakage; validation clean; pixel/runtime evidence for each rendering gate; frame and memory budgets measured. |
