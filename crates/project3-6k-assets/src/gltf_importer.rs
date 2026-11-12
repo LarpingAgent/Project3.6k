@@ -1288,4 +1288,38 @@ mod tests {
         assert!(matches!(error, ModelImportError::Image(_)));
         fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn imports_curated_polyhaven_reference_models_from_disk() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/reference_scene/polyhaven");
+        for asset in ["tree_stump_01", "rock_09", "dead_tree_trunk_02", "shrub_03"] {
+            let path = root.join(asset).join(format!("{asset}-1k.gltf"));
+            let model = import_gltf(&path, ModelImportLimits::default())
+                .unwrap_or_else(|error| panic!("failed to import {}: {error}", path.display()));
+            assert!(!model.meshes.is_empty(), "{asset} has no meshes");
+            assert!(
+                !model.instances.is_empty(),
+                "{asset} has no scene instances"
+            );
+            assert!(!model.materials.is_empty(), "{asset} has no PBR materials");
+            assert!(!model.images.is_empty(), "{asset} has no external textures");
+            assert!(
+                model.materials.iter().any(|material| {
+                    material.base_color_texture.is_some()
+                        && material.normal_texture.is_some()
+                        && material.metallic_roughness_texture.is_some()
+                }),
+                "{asset} did not import its base-color, normal, and packed material maps"
+            );
+            eprintln!(
+                "{asset}: {} meshes, {} instances, {} materials, {} images, {} CPU bytes",
+                model.meshes.len(),
+                model.instances.len(),
+                model.materials.len(),
+                model.images.len(),
+                model.byte_size()
+            );
+        }
+    }
 }
