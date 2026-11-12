@@ -35,6 +35,6 @@ Downloaded from `https://api.polyhaven.com/files/{asset-id}` on 2026-11-12. Mode
 | `forrest_ground_03/forrest_ground_03_diff_1k.jpg` | 821,191 | `0a63f012ae0e3663451b5a0e5049975a` |
 | `forrest_ground_03/forrest_ground_03_nor_gl_1k.jpg` | 1,587,102 | `9f44096b43a0f796ae6f52d7fe784698` |
 | `forrest_ground_03/forrest_ground_03_arm_1k.jpg` | 272,025 | `6f166341687a85219ad54e22aabd2547` |
-| `forest_slope/forest_slope_1k.hdr` | 1,911,073 | `d7676fa11b7a6c4cc3333ac6505e08d2` |
+| `forest_slope/forest_slope_2k.hdr` | 7,562,873 | `fa517358699ed72ba8bfc602f192ab5d` |
 
-All five glTF model files imported successfully in `project3-6k-assets` tests. The 1K material maps are intentionally retained beside their source glTF files so relative URIs remain self-contained.
+All five glTF model files imported successfully in `project3-6k-assets` tests. The 1K material maps are intentionally retained beside their source glTF files so relative URIs remain self-contained. Downloads use the resolution listed by each filename; all Poly Haven API-reported byte sizes and MD5 digests were verified.

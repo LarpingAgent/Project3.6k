@@ -332,14 +332,14 @@ mod tests {
 
     fn hdri_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../assets/reference_scene/polyhaven/forest_slope/forest_slope_1k.hdr")
+            .join("../../assets/reference_scene/polyhaven/forest_slope/forest_slope_2k.hdr")
     }
 
     #[test]
     fn imports_linear_hdr_environment_and_generates_mip_chain() {
         let environment = import_environment_hdr(hdri_path(), ModelImportLimits::default())
             .expect("reference HDRI imports");
-        assert_eq!((environment.width, environment.height), (1024, 512));
+        assert_eq!((environment.width, environment.height), (2048, 1024));
         assert_eq!(
             environment
                 .mip_levels

@@ -6,7 +6,7 @@ The PBR reference scene had a directional sun and shadow map, but its constant a
 
 ## Decision
 
-- Use Poly Haven's [Forest Slope](https://polyhaven.com/a/forest_slope) 1K Radiance HDRI, licensed CC0, as the lighting source. Keep the HDR file and provenance in the repository.
+- Initially use Poly Haven's [Forest Slope](https://polyhaven.com/a/forest_slope) Radiance HDRI, licensed CC0, as the lighting source. Its current 2K resolution upgrade is recorded in Decision 0021.
 - Decode bounded HDR data and generate linear-light mip levels in `project3-6k-assets`, which remains independent of Vulkan.
 - Integrate Lambertian diffuse irradiance into nine real spherical-harmonic coefficients during CPU import. Upload the environment texture as FP16 through the Vulkan resource layer; keep its lifetime owned by `ForestScene`.
 - Evaluate diffuse irradiance from the compact coefficients in the PBR fragment shader, and use the HDR texture's ordinary mip chain for roughness-selected specular reflections.
@@ -15,7 +15,7 @@ The PBR reference scene had a directional sun and shadow map, but its constant a
 
 ## Consequences
 
-The scene receives environment-dependent indirect lighting without adding geometry or diffuse texture reads per fragment. The HDRI import and upload took about 35 ms at startup on the test machine; its FP16 mip payload uses 5,592,408 bytes. The 600-frame Release run without Vulkan validation stayed near the 75 Hz display cap at 74.9–77.5 FPS with p95 frame intervals of 13.8–14.3 ms.
+The scene receives environment-dependent indirect lighting without adding geometry or diffuse texture reads per fragment. At the original 1K resolution, the HDRI import and upload took about 35 ms at startup on the test machine; its FP16 mip payload used 5,592,408 bytes. The 600-frame Release run without Vulkan validation stayed near the 75 Hz display cap at 74.9–77.5 FPS with p95 frame intervals of 13.8–14.3 ms.
 
 The visual reference is [forest-pine-ibl-final.png](../../artifacts/visual-verification/forest-pine-ibl-final.png). It shows lifted shadow detail with directional shadows retained. The pine canopy is still dark and the technical scene remains sparse.
 

@@ -1347,7 +1347,7 @@ fn load_environment(
     hdr_format: vk::Format,
 ) -> Result<EnvironmentResources> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../assets/reference_scene/polyhaven/forest_slope/forest_slope_1k.hdr");
+        .join("../../assets/reference_scene/polyhaven/forest_slope/forest_slope_2k.hdr");
     let started = Instant::now();
     let decoded = import_environment_hdr(&path, ModelImportLimits::default())?;
     let gpu_bytes = decoded

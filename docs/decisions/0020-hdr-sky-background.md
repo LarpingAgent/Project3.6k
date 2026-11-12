@@ -13,6 +13,6 @@ After environment lighting was added, the HDRI affected material shading but the
 
 ## Consequences
 
-The reference scene now shows an external forest environment behind the technical ground and props. A 1280×720 Release capture is recorded at [forest-pine-skybox-final.png](../../artifacts/visual-verification/forest-pine-skybox-final.png). The backdrop is visibly soft at the retained 1K resolution and meets the flat technical ground at a hard horizon; a higher resolution environment and ground blending remain future visual work.
+The reference scene now shows an external forest environment behind the technical ground and props. A 1280×720 Release capture from the original 1K environment is recorded at [forest-pine-skybox-final.png](../../artifacts/visual-verification/forest-pine-skybox-final.png). That backdrop is visibly soft and meets the flat technical ground at a hard horizon; the 2K source upgrade is recorded in Decision 0021, while ground blending remains future work.
 
 On the NVIDIA GeForce GTX 1660 SUPER, a 600-frame Release run with the sky pass measured 73.2–77.4 FPS, 12.9–13.7 ms average frame intervals, and 13.8–14.3 ms p95. The run received keyboard input and is therefore an interactive desktop measurement, not an isolated GPU benchmark. The sky uses one full-screen draw and does not add model geometry.
