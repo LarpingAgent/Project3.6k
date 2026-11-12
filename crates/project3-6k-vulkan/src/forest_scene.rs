@@ -27,6 +27,8 @@ use super::{
 
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.vert.spv"));
 const FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.frag.spv"));
+const SKY_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.vert.spv"));
+const SKY_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv"));
 const SHADOW_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
 const SHADOW_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));
 const MATERIAL_TEXTURE_COUNT: usize = 5;
@@ -45,6 +47,7 @@ const SUN_TARGET: Vec3 = Vec3::new(0.0, 0.5, -2.5);
 struct SceneUniform {
     view_projection: [[f32; 4]; 4],
     sun_view_projection: [[f32; 4]; 4],
+    inverse_view_projection: [[f32; 4]; 4],
     camera_position: [f32; 4],
     sun_direction: [f32; 4],
     sun_color: [f32; 4],
@@ -110,6 +113,7 @@ pub(super) struct ForestScene {
     ground_material_set: vk::DescriptorSet,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    sky_pipeline: vk::Pipeline,
     shadow_pipeline: vk::Pipeline,
     camera_buffers: Vec<BufferAllocation>,
     ground: Option<GroundResources>,
@@ -154,6 +158,7 @@ impl ForestScene {
             ground_material_set: vk::DescriptorSet::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
+            sky_pipeline: vk::Pipeline::null(),
             shadow_pipeline: vk::Pipeline::null(),
             camera_buffers: Vec::new(),
             ground: None,
@@ -231,6 +236,9 @@ impl ForestScene {
         let uniform = SceneUniform {
             view_projection,
             sun_view_projection: sun_view_projection().to_cols_array_2d(),
+            inverse_view_projection: Mat4::from_cols_array_2d(&view_projection)
+                .inverse()
+                .to_cols_array_2d(),
             camera_position: [
                 camera_position[0],
                 camera_position[1],
@@ -361,15 +369,15 @@ impl ForestScene {
             extent,
         }];
         let scene_set = [self.scene_descriptor_sets[frame_index]];
-        // SAFETY: All pipelines, descriptors, buffers and the render pass are live for this draw.
+        // SAFETY: The sky and PBR pipelines, descriptors, buffers, and render pass are live.
         unsafe {
+            self.device.cmd_set_viewport(command_buffer, 0, &viewport);
+            self.device.cmd_set_scissor(command_buffer, 0, &scissor);
             self.device.cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline,
+                self.sky_pipeline,
             );
-            self.device.cmd_set_viewport(command_buffer, 0, &viewport);
-            self.device.cmd_set_scissor(command_buffer, 0, &scissor);
             self.device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -377,6 +385,12 @@ impl ForestScene {
                 0,
                 &scene_set,
                 &[],
+            );
+            self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            self.device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline,
             );
         }
 
@@ -578,7 +592,79 @@ impl ForestScene {
                 return Err(error.into());
             }
         };
+        self.create_sky_pipeline(render_pass)?;
         self.create_shadow_pipeline(shadow_render_pass)?;
+        Ok(())
+    }
+
+    fn create_sky_pipeline(&mut self, render_pass: vk::RenderPass) -> Result<()> {
+        let vertex_shader = ShaderModule::new(&self.device, SKY_VERTEX_SHADER)?;
+        let fragment_shader = ShaderModule::new(&self.device, SKY_FRAGMENT_SHADER)?;
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vertex_shader.handle)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment_shader.handle)
+                .name(c"main"),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+            .primitive_restart_enable(false);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(false)
+            .depth_write_enable(false)
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false);
+        let color_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let color_blending =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_attachments);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisampling)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blending)
+            .dynamic_state(&dynamic_state)
+            .layout(self.pipeline_layout)
+            .render_pass(render_pass)
+            .subpass(0)];
+        // SAFETY: The HDR render pass and scene layout are live for this background pipeline.
+        self.sky_pipeline = match unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+        } {
+            Ok(mut pipelines) => pipelines.remove(0),
+            Err((pipelines, error)) => {
+                // SAFETY: Any handles returned on partial pipeline failure belong to this device.
+                unsafe {
+                    for pipeline in pipelines {
+                        self.device.destroy_pipeline(pipeline, None);
+                    }
+                }
+                return Err(error.into());
+            }
+        };
         Ok(())
     }
 
@@ -1013,6 +1099,9 @@ impl Drop for ForestScene {
         unsafe {
             if self.pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.pipeline, None);
+            }
+            if self.sky_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.sky_pipeline, None);
             }
             if self.shadow_pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.shadow_pipeline, None);

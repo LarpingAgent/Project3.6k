@@ -19,4 +19,4 @@ The scene receives environment-dependent indirect lighting without adding geomet
 
 The visual reference is [forest-pine-ibl-final.png](../../artifacts/visual-verification/forest-pine-ibl-final.png). It shows lifted shadow detail with directional shadows retained. The pine canopy is still dark and the technical scene remains sparse.
 
-This is a practical approximation, not a complete split-sum IBL solution: diffuse irradiance uses second-order spherical harmonics, while specular uses box-filtered mip levels without GGX prefiltering or a BRDF LUT. The HDRI is not drawn as a visible sky. Those remain follow-up rendering work.
+This is a practical approximation, not a complete split-sum IBL solution: diffuse irradiance uses second-order spherical harmonics, while specular uses box-filtered mip levels without GGX prefiltering or a BRDF LUT. At this decision stage the HDRI was used only for lighting; the later full-screen sky pass is recorded in Decision 0020.

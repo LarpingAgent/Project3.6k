@@ -11,6 +11,7 @@ layout(location = 4) in vec4 vertex_color;
 layout(set = 0, binding = 0) uniform SceneUniform {
     mat4 view_projection;
     mat4 sun_view_projection;
+    mat4 inverse_view_projection;
     vec4 camera_position;
     vec4 sun_direction;
     vec4 sun_color;

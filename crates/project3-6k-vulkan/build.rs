@@ -17,6 +17,8 @@ fn main() {
     for shader in [
         "forest.vert",
         "forest.frag",
+        "sky.vert",
+        "sky.frag",
         "shadow.vert",
         "shadow.frag",
         "tonemap.vert",
