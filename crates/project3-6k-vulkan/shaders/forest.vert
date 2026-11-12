@@ -13,6 +13,7 @@ layout(set = 0, binding = 0) uniform SceneUniform {
     vec4 sun_direction;
     vec4 sun_color;
     vec4 ambient_color;
+    vec4 irradiance_sh[9];
 } scene;
 
 layout(push_constant) uniform MaterialPushConstants {

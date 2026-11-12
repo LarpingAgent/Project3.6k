@@ -10,7 +10,7 @@ use ash::vk;
 use glam::{Mat4, Quat, Vec3, Vec4};
 use project3_6k_assets::{
     AlphaMode, AsyncModelLoader, CpuMaterialAsset, ModelImportLimits, TextureAsset, TextureBinding,
-    TextureMipMode, import_image,
+    TextureMipMode, import_environment_hdr, import_image,
 };
 use tracing::info;
 
@@ -49,6 +49,7 @@ struct SceneUniform {
     sun_direction: [f32; 4],
     sun_color: [f32; 4],
     ambient_color: [f32; 4],
+    irradiance_sh: [[f32; 4]; 9],
 }
 
 #[repr(C, align(16))]
@@ -76,6 +77,12 @@ struct GroundResources {
     gpu_bytes: usize,
 }
 
+struct EnvironmentResources {
+    texture: TextureResource,
+    gpu_bytes: usize,
+    irradiance_sh: [[f32; 4]; 9],
+}
+
 struct FallbackTextures {
     base_color: TextureResource,
     normal: TextureResource,
@@ -89,6 +96,7 @@ pub(super) struct ForestSceneInit<'a> {
     pub(super) shadow_targets: &'a [ShadowTarget],
     pub(super) graphics_queue: vk::Queue,
     pub(super) queue_family_index: u32,
+    pub(super) hdr_format: vk::Format,
     pub(super) srgb_format: vk::Format,
     pub(super) linear_format: vk::Format,
 }
@@ -105,6 +113,8 @@ pub(super) struct ForestScene {
     shadow_pipeline: vk::Pipeline,
     camera_buffers: Vec<BufferAllocation>,
     ground: Option<GroundResources>,
+    environment: Option<TextureResource>,
+    irradiance_sh: [[f32; 4]; 9],
     fallbacks: Option<FallbackTextures>,
     gpu_assets: GpuAssetCache,
     models: Vec<PlacedModel>,
@@ -122,6 +132,7 @@ impl ForestScene {
             shadow_targets,
             graphics_queue,
             queue_family_index,
+            hdr_format,
             srgb_format,
             linear_format,
         } = init;
@@ -146,6 +157,8 @@ impl ForestScene {
             shadow_pipeline: vk::Pipeline::null(),
             camera_buffers: Vec::new(),
             ground: None,
+            environment: None,
+            irradiance_sh: [[0.0; 4]; 9],
             fallbacks: None,
             gpu_assets,
             models: Vec::new(),
@@ -159,6 +172,16 @@ impl ForestScene {
             srgb_format,
             linear_format,
         )?);
+        let environment = load_environment(
+            device,
+            memory_properties,
+            graphics_queue,
+            queue_family_index,
+            hdr_format,
+        )?;
+        let environment_bytes = environment.gpu_bytes;
+        scene.irradiance_sh = environment.irradiance_sh;
+        scene.environment = Some(environment.texture);
         scene.fallbacks = Some(FallbackTextures::new(
             device,
             memory_properties,
@@ -191,6 +214,7 @@ impl ForestScene {
             placements = scene.models.len(),
             gpu_model_bytes = model_bytes,
             gpu_ground_bytes = ground_bytes,
+            gpu_environment_bytes = environment_bytes,
             shadow_map_resolution = SHADOW_MAP_EXTENT,
             "PBR reference scene uploaded"
         );
@@ -216,6 +240,7 @@ impl ForestScene {
             sun_direction: [sun_direction.x, sun_direction.y, sun_direction.z, 1.0],
             sun_color: [3.2, 2.9, 2.55, 1.0],
             ambient_color: [0.18, 0.22, 0.17, 1.0],
+            irradiance_sh: self.irradiance_sh,
         };
         self.camera_buffers[frame_index].upload(struct_bytes(&uniform))
     }
@@ -411,8 +436,13 @@ impl ForestScene {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
-        // SAFETY: The scene set contains its per-frame uniform and comparison shadow sampler.
+        // SAFETY: The scene set contains its per-frame uniform, shadow map, and environment map.
         self.descriptor_set_layout = unsafe {
             self.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&scene_bindings),
@@ -721,6 +751,7 @@ impl ForestScene {
         let material_descriptor_count = material_set_count
             .checked_mul(MATERIAL_TEXTURE_COUNT)
             .and_then(|count| count.checked_add(shadow_targets.len()))
+            .and_then(|count| count.checked_add(FRAMES_IN_FLIGHT))
             .and_then(|count| u32::try_from(count).ok())
             .ok_or(VulkanRendererError::GpuAssetSizeOverflow)?;
         let pool_sizes = [
@@ -737,7 +768,7 @@ impl ForestScene {
             .checked_add(material_set_count)
             .and_then(|count| u32::try_from(count).ok())
             .ok_or(VulkanRendererError::GpuAssetSizeOverflow)?;
-        // SAFETY: Pool sizes cover all scene uniforms, shadow maps, and five sampled maps per material.
+        // SAFETY: Pool sizes cover scene uniforms, shadow/environment maps, and five maps per material.
         self.descriptor_pool = unsafe {
             self.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -758,6 +789,10 @@ impl ForestScene {
             .zip(&self.scene_descriptor_sets)
             .zip(shadow_targets)
         {
+            let environment = self
+                .environment
+                .as_ref()
+                .expect("HDR environment is loaded before scene descriptors");
             let buffer_info = [vk::DescriptorBufferInfo::default()
                 .buffer(camera_buffer.buffer)
                 .offset(0)
@@ -766,6 +801,10 @@ impl ForestScene {
                 .sampler(shadow_target.sampler)
                 .image_view(shadow_target.view)
                 .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)];
+            let environment_info = [vk::DescriptorImageInfo::default()
+                .sampler(environment.sampler)
+                .image_view(environment.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(*descriptor_set)
@@ -777,8 +816,13 @@ impl ForestScene {
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&image_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*descriptor_set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&environment_info),
             ];
-            // SAFETY: The set references its per-frame uniform and fence-safe shadow target.
+            // SAFETY: The set references its frame uniform, fence-safe shadow, and owned environment.
             unsafe { self.device.update_descriptor_sets(&writes, &[]) };
         }
 
@@ -1203,6 +1247,46 @@ fn load_ground(
         textures,
         material,
         gpu_bytes,
+    })
+}
+
+fn load_environment(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    queue: vk::Queue,
+    queue_family_index: u32,
+    hdr_format: vk::Format,
+) -> Result<EnvironmentResources> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets/reference_scene/polyhaven/forest_slope/forest_slope_1k.hdr");
+    let started = Instant::now();
+    let decoded = import_environment_hdr(&path, ModelImportLimits::default())?;
+    let gpu_bytes = decoded
+        .byte_size()
+        .checked_div(2)
+        .ok_or(VulkanRendererError::GpuAssetSizeOverflow)?;
+    let irradiance_sh = decoded.irradiance_sh;
+    let texture = TextureResource::new_environment(
+        device,
+        memory_properties,
+        queue,
+        queue_family_index,
+        hdr_format,
+        &decoded,
+    )?;
+    info!(
+        width = decoded.width,
+        height = decoded.height,
+        mip_levels = decoded.mip_levels.len(),
+        cpu_bytes = decoded.byte_size(),
+        gpu_bytes,
+        import_upload_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "external HDR environment imported and uploaded"
+    );
+    Ok(EnvironmentResources {
+        texture,
+        gpu_bytes,
+        irradiance_sh,
     })
 }
 

@@ -19,8 +19,9 @@ ash = "0.38.0"
 ash-window = "0.13.0"
 base64 = "0.22.1"
 glam = "0.34.3"
+half = "2.7.1"
 gltf = { version = "1.4.1", default-features = false, features = ["utils", "names"] }
-image = { version = "=0.25.9", default-features = false, features = ["bmp", "jpeg", "png", "tga", "webp"] }
+image = { version = "=0.25.9", default-features = false, features = ["bmp", "hdr", "jpeg", "png", "tga", "webp"] }
 png = "0.18.1"
 project3-6k-core = { path = "crates/project3-6k-core" }
 project3-6k-assets = { path = "crates/project3-6k-assets" }

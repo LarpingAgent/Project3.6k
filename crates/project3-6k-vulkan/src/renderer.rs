@@ -72,6 +72,8 @@ pub enum VulkanRendererError {
     Asset(#[from] project3_6k_assets::AssetError),
     #[error("could not import an external glTF model: {0}")]
     ModelImport(#[from] project3_6k_assets::ModelImportError),
+    #[error("could not import the HDR environment: {0}")]
+    EnvironmentImport(#[from] project3_6k_assets::EnvironmentImportError),
     #[error("could not build the scene: {0}")]
     Scene(#[from] project3_6k_core::SceneError),
     #[error("the renderer could not resolve a texture immediately after loading it")]
@@ -610,6 +612,7 @@ impl SwapchainState {
                 shadow_targets: &self.shadow_targets,
                 graphics_queue: context.graphics_queue,
                 queue_family_index: context.queue_family_index,
+                hdr_format: self.hdr_format,
                 srgb_format: texture_format,
                 linear_format: linear_texture_format,
             },

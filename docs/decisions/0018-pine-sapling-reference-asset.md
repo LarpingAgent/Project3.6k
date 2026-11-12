@@ -13,6 +13,6 @@ The verified renderer scene had a flat ground plane, rocks, a stump, one dead tr
 
 ## Consequences
 
-The Release reference scene now imports five models and renders seven placements. The model GPU cache reports 138,377,796 resident bytes, about 64.3 MB above the prior four-model scene. The 1280×720 validation screenshot is recorded at `artifacts/visual-verification/forest-pine-stage-2.png`.
+At this stage the Release reference scene imported five models and rendered seven placements. The model GPU cache reported 138,377,796 resident bytes, about 64.3 MB above the prior four-model scene. The 1280×720 validation screenshot is recorded at `artifacts/visual-verification/forest-pine-stage-2.png`. The canopy appeared dark because environment lighting had not yet been added; see Decision 0019 for the later HDR environment work.
 
 The 600-frame Release run with one pine group reported 73.1–78.1 FPS, 12.8–13.7 ms average frame intervals, and 15.2–16.5 ms p95 on the NVIDIA GeForce GTX 1660 SUPER. A three-group trial looked denser but raised p95 to about 34–36 ms, so the current layout keeps one group. The pine canopy remains dark in the screenshot because this renderer has no environment image-based lighting and still uses a sparse technical layout; a complete forest scene is not claimed.

@@ -9,6 +9,7 @@ license.workspace = true
 ash.workspace = true
 ash-window.workspace = true
 glam.workspace = true
+half.workspace = true
 project3-6k-core.workspace = true
 project3-6k-assets.workspace = true
 png.workspace = true

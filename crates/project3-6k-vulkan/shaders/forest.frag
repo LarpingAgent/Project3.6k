@@ -15,8 +15,10 @@ layout(set = 0, binding = 0) uniform SceneUniform {
     vec4 sun_direction;
     vec4 sun_color;
     vec4 ambient_color;
+    vec4 irradiance_sh[9];
 } scene;
 layout(set = 0, binding = 1) uniform sampler2DShadow directional_shadow_map;
+layout(set = 0, binding = 2) uniform sampler2D environment_map;
 
 layout(set = 1, binding = 0) uniform sampler2D base_color_map;
 layout(set = 1, binding = 1) uniform sampler2D normal_map;
@@ -49,6 +51,36 @@ float geometry_schlick_ggx(float n_dot_v, float roughness) {
 
 vec3 fresnel_schlick(float cosine, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cosine, 0.0, 1.0), 5.0);
+}
+
+vec2 environment_uv(vec3 direction) {
+    vec3 d = normalize(direction);
+    return vec2(atan(d.z, d.x) / (2.0 * PI) + 0.5,
+        acos(clamp(d.y, -1.0, 1.0)) / PI);
+}
+
+vec3 sample_environment(vec3 direction, float mip_level) {
+    return textureLod(environment_map, environment_uv(direction), mip_level).rgb;
+}
+
+vec3 evaluate_diffuse_irradiance(vec3 normal) {
+    vec3 n = normalize(normal);
+    float basis[9] = float[9](
+        0.282095,
+        0.488603 * n.y,
+        0.488603 * n.z,
+        0.488603 * n.x,
+        1.092548 * n.x * n.y,
+        1.092548 * n.y * n.z,
+        0.315392 * (3.0 * n.z * n.z - 1.0),
+        1.092548 * n.x * n.z,
+        0.546274 * (n.x * n.x - n.y * n.y)
+    );
+    vec3 irradiance = vec3(0.0);
+    for (int index = 0; index < 9; ++index) {
+        irradiance += scene.irradiance_sh[index].rgb * basis[index];
+    }
+    return max(irradiance, vec3(0.0));
 }
 
 float sun_visibility(vec3 position, vec3 normal, vec3 light) {
@@ -119,8 +151,21 @@ void main() {
 
     float visibility = sun_visibility(world_position, normal, light);
     vec3 direct = evaluate_sun(normal, view, light, base.rgb, metallic, roughness) * visibility;
-    float hemi = 0.45 + 0.55 * max(normal.y, 0.0);
-    vec3 ambient = scene.ambient_color.rgb * hemi * base.rgb * ao;
+    float n_dot_v = max(dot(normal, view), 0.001);
+    vec3 f0 = mix(vec3(0.04), base.rgb, metallic);
+    vec3 environment_fresnel = fresnel_schlick(n_dot_v, f0);
+    float max_environment_mip = float(textureQueryLevels(environment_map) - 1);
+    vec3 diffuse_irradiance = evaluate_diffuse_irradiance(normal) * 0.55;
+    if (material.material_flags.y > 0.5) {
+        diffuse_irradiance += evaluate_diffuse_irradiance(-normal) * 0.35;
+    }
+    vec3 reflected = reflect(-view, normal);
+    vec3 specular_radiance = sample_environment(reflected, roughness * max_environment_mip) * 0.04;
+    vec3 diffuse_weight = (vec3(1.0) - environment_fresnel) * (1.0 - metallic);
+    float indirect_ao = mix(0.55, 1.0, ao);
+    vec3 ambient = (diffuse_weight * base.rgb * diffuse_irradiance
+        + environment_fresnel * specular_radiance) * indirect_ao;
+    ambient += scene.ambient_color.rgb * base.rgb * ao * 0.15;
     vec3 emissive = texture(emissive_map, texture_uv).rgb * material.emissive_factor.rgb;
     vec3 hdr_color = direct + ambient + emissive;
     float camera_distance = length(scene.camera_position.xyz - world_position);

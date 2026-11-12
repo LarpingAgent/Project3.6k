@@ -3,7 +3,8 @@
 use std::ptr;
 
 use ash::vk;
-use project3_6k_assets::TextureAsset;
+use half::f16;
+use project3_6k_assets::{CpuEnvironmentMap, TextureAsset};
 
 use super::{Result, VulkanRendererError};
 
@@ -179,6 +180,15 @@ pub(super) struct TextureResource {
     mip_levels: u32,
 }
 
+struct TextureUploadConfig {
+    format: vk::Format,
+    width: u32,
+    height: u32,
+    bytes_per_pixel: usize,
+    address_mode_u: vk::SamplerAddressMode,
+    address_mode_v: vk::SamplerAddressMode,
+}
+
 impl TextureResource {
     pub(super) fn new(
         device: &ash::Device,
@@ -188,16 +198,125 @@ impl TextureResource {
         format: vk::Format,
         decoded: &TextureAsset,
     ) -> Result<Self> {
-        if decoded.width == 0 || decoded.height == 0 || decoded.mip_levels.is_empty() {
+        let mips = decoded
+            .mip_levels
+            .iter()
+            .map(|level| TextureMipUpload {
+                width: level.width,
+                height: level.height,
+                bytes: &level.rgba8,
+            })
+            .collect::<Vec<_>>();
+        Self::new_from_mips(
+            device,
+            memory_properties,
+            queue,
+            queue_family_index,
+            &mips,
+            TextureUploadConfig {
+                format,
+                width: decoded.width,
+                height: decoded.height,
+                bytes_per_pixel: 4,
+                address_mode_u: vk::SamplerAddressMode::REPEAT,
+                address_mode_v: vk::SamplerAddressMode::REPEAT,
+            },
+        )
+    }
+
+    pub(super) fn new_environment(
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        queue: vk::Queue,
+        queue_family_index: u32,
+        format: vk::Format,
+        decoded: &CpuEnvironmentMap,
+    ) -> Result<Self> {
+        let packed_mips = decoded
+            .mip_levels
+            .iter()
+            .map(|level| {
+                let mut bytes = Vec::with_capacity(level.rgba32f.len() * 8);
+                for pixel in &level.rgba32f {
+                    for channel in pixel {
+                        let finite_half_range = channel.clamp(0.0, f16::MAX.to_f32());
+                        bytes.extend_from_slice(
+                            &f16::from_f32(finite_half_range).to_bits().to_le_bytes(),
+                        );
+                    }
+                }
+                bytes
+            })
+            .collect::<Vec<_>>();
+        let mips = decoded
+            .mip_levels
+            .iter()
+            .zip(&packed_mips)
+            .map(|(level, bytes)| TextureMipUpload {
+                width: level.width,
+                height: level.height,
+                bytes,
+            })
+            .collect::<Vec<_>>();
+        Self::new_from_mips(
+            device,
+            memory_properties,
+            queue,
+            queue_family_index,
+            &mips,
+            TextureUploadConfig {
+                format,
+                width: decoded.width,
+                height: decoded.height,
+                bytes_per_pixel: 8,
+                address_mode_u: vk::SamplerAddressMode::REPEAT,
+                address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            },
+        )
+    }
+
+    fn new_from_mips(
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        queue: vk::Queue,
+        queue_family_index: u32,
+        levels: &[TextureMipUpload<'_>],
+        config: TextureUploadConfig,
+    ) -> Result<Self> {
+        let TextureUploadConfig {
+            format,
+            width,
+            height,
+            bytes_per_pixel,
+            address_mode_u,
+            address_mode_v,
+        } = config;
+        if width == 0 || height == 0 || levels.is_empty() {
             return Err(VulkanRendererError::InvalidGpuAssetTexture);
         }
-        let mip_levels = u32::try_from(decoded.mip_levels.len())
-            .map_err(|_| VulkanRendererError::GpuAssetSizeOverflow)?;
-        let mut staging_data = Vec::new();
-        let mut copy_regions = Vec::with_capacity(decoded.mip_levels.len());
-        for (mip_level, level) in decoded.mip_levels.iter().enumerate() {
+        let mip_levels =
+            u32::try_from(levels.len()).map_err(|_| VulkanRendererError::GpuAssetSizeOverflow)?;
+        let mut staging_bytes = 0usize;
+        for (index, level) in levels.iter().enumerate() {
+            let expected_bytes = (level.width as usize)
+                .checked_mul(level.height as usize)
+                .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+                .ok_or(VulkanRendererError::GpuAssetSizeOverflow)?;
+            if level.bytes.len() != expected_bytes
+                || level.width != (width >> index).max(1)
+                || level.height != (height >> index).max(1)
+            {
+                return Err(VulkanRendererError::InvalidGpuAssetTexture);
+            }
+            staging_bytes = staging_bytes
+                .checked_add(level.bytes.len())
+                .ok_or(VulkanRendererError::GpuAssetSizeOverflow)?;
+        }
+        let mut staging_data = Vec::with_capacity(staging_bytes);
+        let mut copy_regions = Vec::with_capacity(levels.len());
+        for (mip_level, level) in levels.iter().enumerate() {
             let buffer_offset = staging_data.len() as u64;
-            staging_data.extend_from_slice(&level.rgba8);
+            staging_data.extend_from_slice(level.bytes);
             copy_regions.push(
                 vk::BufferImageCopy::default()
                     .buffer_offset(buffer_offset)
@@ -232,8 +351,8 @@ impl TextureResource {
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D {
-                width: decoded.width,
-                height: decoded.height,
+                width,
+                height,
                 depth: 1,
             })
             .mip_levels(mip_levels)
@@ -288,13 +407,13 @@ impl TextureResource {
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
             .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-            .address_mode_u(vk::SamplerAddressMode::REPEAT)
-            .address_mode_v(vk::SamplerAddressMode::REPEAT)
-            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .address_mode_u(address_mode_u)
+            .address_mode_v(address_mode_v)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .min_lod(0.0)
             .max_lod(mip_levels.saturating_sub(1) as f32)
             .border_color(vk::BorderColor::INT_OPAQUE_BLACK);
-        // SAFETY: Linear filtering and normalized repeat addressing are supported by the formats.
+        // SAFETY: Linear filtering and normalized addressing are supported by the selected formats.
         texture.sampler = unsafe { device.create_sampler(&sampler_info, None)? };
         Ok(texture)
     }
@@ -401,6 +520,12 @@ impl TextureResource {
         unsafe { self.device.destroy_command_pool(command_pool, None) };
         result
     }
+}
+
+struct TextureMipUpload<'a> {
+    width: u32,
+    height: u32,
+    bytes: &'a [u8],
 }
 
 impl Drop for TextureResource {
