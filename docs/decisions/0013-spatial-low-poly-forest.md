@@ -12,7 +12,7 @@ The Phase 3 forest used camera-facing polygons with authored normals. That was e
 
 ## Decision
 
-Keep the six-node bounded scene and generate its upload geometry at initialization. Use a horizontal ground plane and extrude the forest panel, tree canopies/trunks, and distant ridge into shallow prisms. Generate outward side normals plus front/back normals, transform positions and normals through each node's TRS, and preserve one indexed range per node. Keep the existing static texture and ambient/directional shader lighting.
+Keep the six-node bounded scene and generate its upload geometry at initialization. Use a horizontal ground plane and extrude the forest panel, tree canopies/trunks, and distant ridge into shallow prisms. Fold each canopy front into two shallow geometric facets so its normals produce visible directional-light contrast; generate outward side and back normals, transform positions and normals through each node's TRS, and preserve one indexed range per node. Keep the existing static texture and ambient/directional shader lighting.
 
 ## Consequences
 

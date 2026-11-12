@@ -333,6 +333,10 @@ fn append_prism(
     vertices: &mut Vec<ForestGpuVertex>,
     indices: &mut Vec<u16>,
 ) -> Result<()> {
+    if (2..=4).contains(&polygon.mesh_index) && polygon.boundary.len() == 3 {
+        return append_faceted_canopy(node, polygon, vertices, indices);
+    }
+
     for triangle in polygon.triangles {
         let front = triangle.map(|index| source_point(SOURCE_VERTICES[index], polygon.half_depth));
         push_triangle(node, Vec3::Z, front, vertices, indices)?;
@@ -383,6 +387,133 @@ fn append_prism(
         push_triangle(node, normal, [side[0], side[2], side[3]], vertices, indices)?;
     }
     Ok(())
+}
+
+fn append_faceted_canopy(
+    node: SceneNode,
+    polygon: &ForestPolygon,
+    vertices: &mut Vec<ForestGpuVertex>,
+    indices: &mut Vec<u16>,
+) -> Result<()> {
+    let left_source = SOURCE_VERTICES[polygon.boundary[0]];
+    let right_source = SOURCE_VERTICES[polygon.boundary[1]];
+    let apex_source = SOURCE_VERTICES[polygon.boundary[2]];
+    let midpoint_source = SourceVertex {
+        position: [
+            (left_source.position[0] + right_source.position[0]) * 0.5,
+            (left_source.position[1] + right_source.position[1]) * 0.5,
+        ],
+        color: [
+            (left_source.color[0] + right_source.color[0]) * 0.5,
+            (left_source.color[1] + right_source.color[1]) * 0.5,
+            (left_source.color[2] + right_source.color[2]) * 0.5,
+        ],
+    };
+
+    // Fold the canopy front along a shallow ridge so its two real faces respond to the
+    // fixed directional light from different angles.
+    let left_front = source_point(left_source, 0.0);
+    let midpoint_front = source_point(midpoint_source, polygon.half_depth);
+    let right_front = source_point(right_source, 0.0);
+    let apex_front = source_point(apex_source, 0.0);
+    push_facet_triangle(
+        node,
+        [left_front, midpoint_front, apex_front],
+        vertices,
+        indices,
+    )?;
+    push_facet_triangle(
+        node,
+        [midpoint_front, right_front, apex_front],
+        vertices,
+        indices,
+    )?;
+
+    let left_back = source_point(left_source, -polygon.half_depth);
+    let midpoint_back = source_point(midpoint_source, -polygon.half_depth);
+    let right_back = source_point(right_source, -polygon.half_depth);
+    let apex_back = source_point(apex_source, -polygon.half_depth);
+    push_triangle(
+        node,
+        -Vec3::Z,
+        [apex_back, midpoint_back, left_back],
+        vertices,
+        indices,
+    )?;
+    push_triangle(
+        node,
+        -Vec3::Z,
+        [apex_back, right_back, midpoint_back],
+        vertices,
+        indices,
+    )?;
+
+    let center = (Vec3::from_array([left_source.position[0], left_source.position[1], 0.0])
+        + Vec3::from_array([right_source.position[0], right_source.position[1], 0.0])
+        + Vec3::from_array([apex_source.position[0], apex_source.position[1], 0.0]))
+        / 3.0;
+    let front_boundary = [left_front, midpoint_front, right_front, apex_front];
+    let back_boundary = [left_back, midpoint_back, right_back, apex_back];
+    for edge in 0..front_boundary.len() {
+        let next = (edge + 1) % front_boundary.len();
+        let start = front_boundary[edge];
+        let end = front_boundary[next];
+        let edge_vector = Vec3::new(
+            end.position.x - start.position.x,
+            end.position.y - start.position.y,
+            0.0,
+        );
+        let mut normal = Vec3::new(edge_vector.y, -edge_vector.x, 0.0).normalize_or_zero();
+        let midpoint = Vec3::new(
+            (start.position.x + end.position.x) * 0.5,
+            (start.position.y + end.position.y) * 0.5,
+            0.0,
+        );
+        if normal.dot(midpoint - center) < 0.0 {
+            normal = -normal;
+        }
+
+        let u = edge_vector.length() * 4.0;
+        let start_back = back_boundary[edge];
+        let end_back = back_boundary[next];
+        let side = [
+            MeshPoint {
+                uv: [0.0, 0.0],
+                ..start
+            },
+            MeshPoint {
+                uv: [u, 0.0],
+                ..end
+            },
+            MeshPoint {
+                uv: [u, 1.0],
+                ..end_back
+            },
+            MeshPoint {
+                uv: [0.0, 1.0],
+                ..start_back
+            },
+        ];
+        push_triangle(node, normal, [side[0], side[1], side[2]], vertices, indices)?;
+        push_triangle(node, normal, [side[0], side[2], side[3]], vertices, indices)?;
+    }
+    Ok(())
+}
+
+fn push_facet_triangle(
+    node: SceneNode,
+    mut points: [MeshPoint; 3],
+    vertices: &mut Vec<ForestGpuVertex>,
+    indices: &mut Vec<u16>,
+) -> Result<()> {
+    let mut normal = (points[1].position - points[0].position)
+        .cross(points[2].position - points[0].position)
+        .normalize_or_zero();
+    if normal.z < 0.0 {
+        points.swap(1, 2);
+        normal = -normal;
+    }
+    push_triangle(node, normal, points, vertices, indices)
 }
 
 fn source_point(source: SourceVertex, depth: f32) -> MeshPoint {
@@ -485,6 +616,37 @@ mod tests {
             assert!(
                 (lowest_y + 0.71).abs() < 0.002,
                 "tree mesh {mesh_index} bottomed at {lowest_y}"
+            );
+        }
+    }
+
+    #[test]
+    fn canopy_facets_receive_visibly_different_directional_light() {
+        let geometry = build_forest_geometry().unwrap();
+        let light = glam::Vec3::new(-0.45, 0.75, 0.55).normalize();
+
+        for mesh_index in 2..=4 {
+            let (first_index, index_count) = geometry.draw_ranges[mesh_index as usize];
+            let first = first_index as usize;
+            let end = first + index_count as usize;
+            let illumination = geometry.indices[first..end]
+                .iter()
+                .map(|index| glam::Vec3::from_array(geometry.vertices[*index as usize].normal))
+                .filter(|normal| normal.z > 0.5 && normal.x.abs() > 0.2)
+                .map(|normal| {
+                    let diffuse = normal.dot(light).max(0.0);
+                    0.26 + (1.0 - 0.26) * diffuse
+                })
+                .collect::<Vec<_>>();
+
+            let minimum = illumination.iter().copied().fold(f32::INFINITY, f32::min);
+            let maximum = illumination
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                maximum - minimum > 0.15,
+                "tree mesh {mesh_index} had too little front-facet lighting contrast: {minimum}..{maximum}"
             );
         }
     }

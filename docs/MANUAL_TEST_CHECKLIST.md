@@ -28,7 +28,7 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 
 ## Phase 3f basic lighting
 
-- **NOT VERIFIED BY AUTOMATION** — Confirm canopy facets show the expected light-to-dark variation, trunks and ground remain visible under the ambient floor, and lighting stays fixed in world space while the camera turns.
+- **NOT VERIFIED BY AUTOMATION** — Confirm the two folded faces on each canopy show different brightness, trunks and ground remain visible under the ambient floor, and lighting stays fixed in world space while the camera turns. Cast shadows are not implemented.
 - **NOT VERIFIED BY AUTOMATION** — Move around the scene and resize the window; confirm normals do not produce abrupt shading seams or black faces.
 
 ## Phase 4 profiling and debug display
