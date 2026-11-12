@@ -429,16 +429,16 @@ impl Drop for ShaderModule {
     }
 }
 
-struct BufferAllocation {
+pub(super) struct BufferAllocation {
     device: ash::Device,
-    buffer: vk::Buffer,
+    pub(super) buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size: vk::DeviceSize,
     memory_flags: vk::MemoryPropertyFlags,
 }
 
 impl BufferAllocation {
-    fn new(
+    pub(super) fn new(
         device: &ash::Device,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
         size: usize,
@@ -526,6 +526,53 @@ impl BufferAllocation {
         unsafe { self.device.unmap_memory(self.memory) };
         flush_result?;
         Ok(())
+    }
+
+    pub(super) fn download(&self, byte_count: usize) -> Result<Vec<u8>> {
+        if byte_count as vk::DeviceSize > self.size {
+            return Err(VulkanRendererError::BufferUploadTooLarge {
+                actual: byte_count,
+                capacity: self.size,
+            });
+        }
+        if !self
+            .memory_flags
+            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+        {
+            return Err(VulkanRendererError::NoCompatibleMemory(
+                "host-visible readback",
+            ));
+        }
+        // SAFETY: The allocation is host-visible, and callers wait for its GPU writer first.
+        let mapped = unsafe {
+            self.device
+                .map_memory(self.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+        };
+        let invalidate_result = if !self
+            .memory_flags
+            .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+        {
+            let range = [vk::MappedMemoryRange::default()
+                .memory(self.memory)
+                .offset(0)
+                .size(vk::WHOLE_SIZE)];
+            // SAFETY: The whole mapped allocation is invalidated, satisfying atom alignment.
+            unsafe { self.device.invalidate_mapped_memory_ranges(&range) }
+        } else {
+            Ok(())
+        };
+        if let Err(error) = invalidate_result {
+            // SAFETY: The map operation above succeeded and must be closed on this error path.
+            unsafe { self.device.unmap_memory(self.memory) };
+            return Err(error.into());
+        }
+        let mut bytes = vec![0; byte_count];
+        // SAFETY: The mapped allocation covers the requested byte count and destination is sized.
+        unsafe {
+            ptr::copy_nonoverlapping(mapped.cast::<u8>(), bytes.as_mut_ptr(), byte_count);
+            self.device.unmap_memory(self.memory);
+        }
+        Ok(bytes)
     }
 }
 

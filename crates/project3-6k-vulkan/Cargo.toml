@@ -11,6 +11,7 @@ ash-window.workspace = true
 glam.workspace = true
 project3-6k-core.workspace = true
 project3-6k-assets.workspace = true
+png.workspace = true
 raw-window-handle.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

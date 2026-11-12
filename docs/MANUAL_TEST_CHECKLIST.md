@@ -9,6 +9,11 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 - **NOT VERIFIED BY AUTOMATION** — Open a separately supplied glTF/GLB with embedded and relative PNG/JPEG resources; confirm validation errors identify unsupported content and malformed external paths cleanly.
 - **NOT VERIFIED BY AUTOMATION** — Confirm each added asset has a source, author, license, and attribution record in `assets/ASSET_SOURCES.md`.
 
+## Phase 4b renderer image evidence
+
+- `cargo run -p project3-6k-app -- --run-frames 5 --validation --capture-frame artifacts/visual-verification/baseline-before-rendering-upgrade.png` captures one real swapchain frame and exits only after five submitted frames. This baseline was captured and opened successfully; inspect it before comparing later builds.
+- **NOT VERIFIED BY AUTOMATION** — After PBR/shadow changes, save a second PNG beside the baseline and compare surface maps, material response, shadow contrast, and foliage detail at the same window extent.
+
 ## Phase 2 application and window lifecycle
 
 - **NOT VERIFIED BY AUTOMATION** — Run `cargo run -p project3-6k-app`, confirm the window appears, press Escape, and confirm it closes cleanly.

@@ -1119,6 +1119,7 @@ dependencies = [
  "ash",
  "ash-window",
  "glam",
+ "png",
  "project3-6k-assets",
  "project3-6k-core",
  "raw-window-handle",

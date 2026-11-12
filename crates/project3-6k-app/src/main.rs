@@ -11,7 +11,7 @@ fn main() {
         Ok(options) => options,
         Err(error) => {
             eprintln!(
-                "{error}\nUsage: project3-6k [--run-frames N [--resize-stress]] [--auto-close] [--validation]"
+                "{error}\nUsage: project3-6k [--run-frames N [--resize-stress]] [--capture-frame PATH] [--auto-close] [--validation]"
             );
             std::process::exit(2);
         }
@@ -30,6 +30,7 @@ fn parse_args(
     let mut auto_close = false;
     let mut validation = false;
     let mut resize_stress = false;
+    let mut capture_frame = None;
     let mut args = args.into_iter();
 
     while let Some(argument) = args.next() {
@@ -67,6 +68,18 @@ fn parse_args(
                 }
                 resize_stress = true;
             }
+            "--capture-frame" => {
+                if capture_frame.is_some() {
+                    return Err("--capture-frame may only be specified once".into());
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--capture-frame requires an output path".to_owned())?;
+                if value.starts_with("--") {
+                    return Err("--capture-frame requires an output path".into());
+                }
+                capture_frame = Some(std::path::PathBuf::from(value));
+            }
             unknown => return Err(format!("unrecognized argument: {unknown}")),
         }
     }
@@ -83,6 +96,7 @@ fn parse_args(
         auto_close,
         validation,
         resize_stress,
+        capture_frame,
     })
 }
 
@@ -104,6 +118,7 @@ mod tests {
                 auto_close: false,
                 validation: false,
                 resize_stress: false,
+                capture_frame: None,
             })
         );
     }
@@ -117,6 +132,7 @@ mod tests {
                 auto_close: true,
                 validation: false,
                 resize_stress: false,
+                capture_frame: None,
             })
         );
     }
@@ -148,6 +164,7 @@ mod tests {
                 auto_close: false,
                 validation: true,
                 resize_stress: true,
+                capture_frame: None,
             })
         );
     }
@@ -156,5 +173,26 @@ mod tests {
     fn rejects_resize_stress_without_frame_limit_and_duplicate_validation() {
         assert!(parse_args(arguments(&["--resize-stress"])).is_err());
         assert!(parse_args(arguments(&["--validation", "--validation"])).is_err());
+    }
+
+    #[test]
+    fn parses_frame_capture_path() {
+        assert_eq!(
+            parse_args(arguments(&[
+                "--run-frames",
+                "5",
+                "--capture-frame",
+                "out/frame.png",
+            ])),
+            Ok(RunOptions {
+                run_frames: Some(5),
+                auto_close: false,
+                validation: false,
+                resize_stress: false,
+                capture_frame: Some(std::path::PathBuf::from("out/frame.png")),
+            })
+        );
+        assert!(parse_args(arguments(&["--capture-frame"])).is_err());
+        assert!(parse_args(arguments(&["--capture-frame", "x", "--capture-frame", "y"])).is_err());
     }
 }

@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use project3_6k_core::{Camera, FrameClock, FrameProfiler};
 use project3_6k_vulkan::{VulkanRenderer, VulkanRendererError};
@@ -41,7 +44,7 @@ pub enum ApplicationError {
 }
 
 /// Controls automatic exit for repeatable renderer lifecycle checks.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RunOptions {
     /// Exit after this many frames have been submitted successfully.
     pub run_frames: Option<u64>,
@@ -51,6 +54,8 @@ pub struct RunOptions {
     pub validation: bool,
     /// Programmatically resize, minimize, and restore the window during the run.
     pub resize_stress: bool,
+    /// Capture one rendered swapchain frame to this PNG path, then continue the run.
+    pub capture_frame: Option<PathBuf>,
 }
 
 /// Starts the Project3.6k application and runs its native event loop.
@@ -65,7 +70,7 @@ pub fn run_with_options(options: RunOptions) -> Result<(), ApplicationError> {
         Instant::now() + TARGET_FRAME_DURATION,
     ));
     let mut application = EngineApplication::default();
-    application.options = options;
+    application.options = options.clone();
     event_loop.run_app(&mut application)?;
     let failure = application.failure.take();
     let validation_monitor = application
@@ -139,7 +144,15 @@ impl ApplicationHandler for EngineApplication {
         info!("native window created");
 
         match VulkanRenderer::new_with_validation(&window, self.options.validation) {
-            Ok(renderer) => {
+            Ok(mut renderer) => {
+                if let Some(path) = self.options.capture_frame.clone()
+                    && let Err(error) = renderer.capture_next_frame(path)
+                {
+                    error!(%error, "frame capture could not be scheduled");
+                    self.failure = Some(ApplicationError::Renderer(error));
+                    event_loop.exit();
+                    return;
+                }
                 self.clock = Some(FrameClock::default());
                 self.renderer = Some(renderer);
                 self.window = Some(window);

@@ -1,4 +1,7 @@
-use std::ffi::CStr;
+use std::{
+    ffi::CStr,
+    path::{Path, PathBuf},
+};
 
 use ash::{Entry, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -25,6 +28,7 @@ const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 const DEBUG_UTILS_EXTENSION: &CStr = c"VK_EXT_debug_utils";
 const SWAPCHAIN_EXTENSION: &CStr = c"VK_KHR_swapchain";
 pub(super) const FRAMES_IN_FLIGHT: usize = 2;
+const MAX_CAPTURE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Errors returned by Vulkan initialization and frame submission.
 #[derive(Debug, Error)]
@@ -66,6 +70,26 @@ pub enum VulkanRendererError {
         actual: usize,
         capacity: vk::DeviceSize,
     },
+    #[error("the presentation surface does not support transfer-source swapchain images")]
+    UnsupportedCaptureSurface,
+    #[error("swapchain pixel format {0:?} is not supported by PNG frame capture")]
+    UnsupportedCaptureFormat(vk::Format),
+    #[error("frame capture requires {actual} bytes, above the {limit}-byte limit")]
+    CaptureTooLarge { actual: usize, limit: usize },
+    #[error("frame capture received an empty swapchain extent")]
+    InvalidCaptureExtent,
+    #[error("frame capture output path is empty")]
+    EmptyCapturePath,
+    #[error("a frame capture is already scheduled")]
+    CaptureAlreadyScheduled,
+    #[error("could not create screenshot {path}: {source}")]
+    CaptureIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not encode screenshot PNG: {0}")]
+    CapturePng(#[from] png::EncodingError),
 }
 
 type Result<T> = std::result::Result<T, VulkanRendererError>;
@@ -357,6 +381,7 @@ struct SwapchainState {
     format: vk::Format,
     depth_format: vk::Format,
     extent: vk::Extent2D,
+    readback_supported: bool,
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
@@ -389,6 +414,7 @@ impl SwapchainState {
             format: vk::Format::UNDEFINED,
             depth_format: vk::Format::UNDEFINED,
             extent: vk::Extent2D::default(),
+            readback_supported: false,
             images: Vec::new(),
             image_views: Vec::new(),
             render_pass: vk::RenderPass::null(),
@@ -440,12 +466,19 @@ impl SwapchainState {
         let surface_format = choose_surface_format(&formats)?;
         let present_mode = choose_present_mode(&present_modes)?;
         self.format = surface_format.format;
+        self.readback_supported = capabilities
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_SRC);
         self.depth_format = choose_depth_format(&context.instance, context.physical_device)?;
         self.extent = choose_extent(&capabilities, window);
 
         let mut image_count = capabilities.min_image_count.saturating_add(1);
         if capabilities.max_image_count != 0 {
             image_count = image_count.min(capabilities.max_image_count);
+        }
+        let mut image_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        if self.readback_supported {
+            image_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
         }
         let create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(context.surface)
@@ -454,7 +487,7 @@ impl SwapchainState {
             .image_color_space(surface_format.color_space)
             .image_extent(self.extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(image_usage)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(choose_composite_alpha(
@@ -573,6 +606,7 @@ impl SwapchainState {
         &mut self,
         context: &VulkanContext,
         view_projection: [[f32; 4]; 4],
+        capture_path: Option<&Path>,
     ) -> Result<FrameDrawOutcome> {
         let frame = &self.frames[self.current_frame];
         let image_available = frame.image_available;
@@ -598,6 +632,7 @@ impl SwapchainState {
                 return Ok(FrameDrawOutcome {
                     submitted: false,
                     recreate_swapchain: true,
+                    captured: false,
                 });
             }
             Err(error) => return Err(error.into()),
@@ -615,12 +650,39 @@ impl SwapchainState {
         self.images_in_flight[image_index] = in_flight;
         let render_finished = self.render_finished[image_index];
 
+        let capture_size = capture_path
+            .map(|_| capture_byte_count(self.extent))
+            .transpose()?;
+        let readback_buffer = if let Some(size) = capture_size {
+            // SAFETY: The physical device belongs to the live instance and its device is active.
+            let memory_properties = unsafe {
+                context
+                    .instance
+                    .get_physical_device_memory_properties(context.physical_device)
+            };
+            Some(forest_scene::BufferAllocation::new(
+                &self.device,
+                &memory_properties,
+                size,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::HOST_VISIBLE,
+                vk::MemoryPropertyFlags::HOST_COHERENT,
+                "host-visible swapchain readback",
+            )?)
+        } else {
+            None
+        };
+
         let command_buffer = self.command_buffers[image_index];
         record_scene_pass(
             &self.device,
             command_buffer,
-            self.render_pass,
-            self.framebuffers[image_index],
+            ScenePassTarget {
+                render_pass: self.render_pass,
+                framebuffer: self.framebuffers[image_index],
+                swapchain_image: self.images[image_index],
+                readback_buffer: readback_buffer.as_ref().map(|buffer| buffer.buffer),
+            },
             self.extent,
             self.forest_scene
                 .as_ref()
@@ -655,10 +717,27 @@ impl SwapchainState {
             .image_indices(&image_indices);
         // SAFETY: The image was acquired from this swapchain; the render-finished semaphore
         // is signaled by the just-submitted queue operation.
-        let recreate_swapchain = match unsafe {
+        let present_result = unsafe {
             self.loader
                 .queue_present(context.present_queue, &present_info)
-        } {
+        };
+        if let (Some(path), Some(buffer), Some(size)) =
+            (capture_path, readback_buffer.as_ref(), capture_size)
+        {
+            // SAFETY: This fence covers the submitted image-to-buffer copy, so the mapped
+            // readback allocation is no longer being written by the GPU.
+            unsafe { self.device.wait_for_fences(&[in_flight], true, u64::MAX)? };
+            let pixels = buffer.download(size)?;
+            write_capture_png(path, self.extent, self.format, pixels)?;
+            info!(
+                path = %path.display(),
+                width = self.extent.width,
+                height = self.extent.height,
+                bytes = size,
+                "captured Vulkan swapchain frame"
+            );
+        }
+        let recreate_swapchain = match present_result {
             Ok(suboptimal) => suboptimal || was_suboptimal,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => true,
             Err(error) => return Err(error.into()),
@@ -667,6 +746,7 @@ impl SwapchainState {
         Ok(FrameDrawOutcome {
             submitted: true,
             recreate_swapchain,
+            captured: capture_path.is_some(),
         })
     }
 
@@ -731,6 +811,7 @@ impl SwapchainState {
 struct FrameDrawOutcome {
     submitted: bool,
     recreate_swapchain: bool,
+    captured: bool,
 }
 
 impl Drop for SwapchainState {
@@ -750,6 +831,7 @@ pub struct VulkanRenderer {
     context: VulkanContext,
     resized: bool,
     suspended: bool,
+    capture_path: Option<PathBuf>,
 }
 
 impl VulkanRenderer {
@@ -767,6 +849,7 @@ impl VulkanRenderer {
             context,
             resized: false,
             suspended: false,
+            capture_path: None,
         })
     }
 
@@ -775,6 +858,33 @@ impl VulkanRenderer {
         self.context
             .validation_enabled
             .then(|| self.context.validation_state.monitor())
+    }
+
+    /// Captures the next successfully submitted swapchain frame to a PNG file.
+    pub fn capture_next_frame(&mut self, path: impl Into<PathBuf>) -> Result<()> {
+        if !self.swapchain.readback_supported {
+            return Err(VulkanRendererError::UnsupportedCaptureSurface);
+        }
+        if self.capture_path.is_some() {
+            return Err(VulkanRendererError::CaptureAlreadyScheduled);
+        }
+        let path = path.into();
+        if path.as_os_str().is_empty() {
+            return Err(VulkanRendererError::EmptyCapturePath);
+        }
+        if !matches!(
+            self.swapchain.format,
+            vk::Format::R8G8B8A8_UNORM
+                | vk::Format::R8G8B8A8_SRGB
+                | vk::Format::B8G8R8A8_UNORM
+                | vk::Format::B8G8R8A8_SRGB
+        ) {
+            return Err(VulkanRendererError::UnsupportedCaptureFormat(
+                self.swapchain.format,
+            ));
+        }
+        self.capture_path = Some(path);
+        Ok(())
     }
 
     /// Marks the swapchain for recreation after a native window resize.
@@ -801,7 +911,12 @@ impl VulkanRenderer {
                 return Ok(false);
             }
         }
-        let outcome = self.swapchain.draw(&self.context, view_projection)?;
+        let outcome =
+            self.swapchain
+                .draw(&self.context, view_projection, self.capture_path.as_deref())?;
+        if outcome.captured {
+            self.capture_path = None;
+        }
         if outcome.recreate_swapchain {
             self.resized = !self.swapchain.recreate(&self.context, window)?;
         }
@@ -918,21 +1033,30 @@ fn create_render_pass(
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
         .color_attachments(&color_attachment)
         .depth_stencil_attachment(&depth_attachment)];
-    let dependencies = [vk::SubpassDependency::default()
-        .src_subpass(vk::SUBPASS_EXTERNAL)
-        .dst_subpass(0)
-        .src_stage_mask(
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-        )
-        .dst_stage_mask(
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-        )
-        .dst_access_mask(
-            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-        )];
+    let dependencies = [
+        vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+            )
+            .dst_stage_mask(
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+            )
+            .dst_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            ),
+        vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+    ];
     let info = vk::RenderPassCreateInfo::default()
         .attachments(&attachments)
         .subpasses(&subpasses)
@@ -941,11 +1065,17 @@ fn create_render_pass(
     Ok(unsafe { device.create_render_pass(&info, None)? })
 }
 
+struct ScenePassTarget {
+    render_pass: vk::RenderPass,
+    framebuffer: vk::Framebuffer,
+    swapchain_image: vk::Image,
+    readback_buffer: Option<vk::Buffer>,
+}
+
 fn record_scene_pass(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
-    render_pass: vk::RenderPass,
-    framebuffer: vk::Framebuffer,
+    target: ScenePassTarget,
     extent: vk::Extent2D,
     scene: &ForestScene,
     frame_index: usize,
@@ -970,8 +1100,8 @@ fn record_scene_pass(
             },
         ];
         let render_pass_info = vk::RenderPassBeginInfo::default()
-            .render_pass(render_pass)
-            .framebuffer(framebuffer)
+            .render_pass(target.render_pass)
+            .framebuffer(target.framebuffer)
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent,
@@ -984,9 +1114,140 @@ fn record_scene_pass(
         );
         scene.record_draw(command_buffer, extent, frame_index);
         device.cmd_end_render_pass(command_buffer);
+        if let Some(readback_buffer) = target.readback_buffer {
+            let to_transfer = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(target.swapchain_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_transfer,
+            );
+            device.cmd_copy_image_to_buffer(
+                command_buffer,
+                target.swapchain_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                readback_buffer,
+                &[vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: extent.width,
+                        height: extent.height,
+                        depth: 1,
+                    })],
+            );
+            let to_present = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(target.swapchain_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_present,
+            );
+        }
         device.end_command_buffer(command_buffer)?;
     }
     Ok(())
+}
+
+fn capture_byte_count(extent: vk::Extent2D) -> Result<usize> {
+    if extent.width == 0 || extent.height == 0 {
+        return Err(VulkanRendererError::InvalidCaptureExtent);
+    }
+    let byte_count = u64::from(extent.width)
+        .checked_mul(u64::from(extent.height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or(VulkanRendererError::CaptureTooLarge {
+            actual: usize::MAX,
+            limit: MAX_CAPTURE_BYTES,
+        })?;
+    if byte_count > MAX_CAPTURE_BYTES {
+        return Err(VulkanRendererError::CaptureTooLarge {
+            actual: byte_count,
+            limit: MAX_CAPTURE_BYTES,
+        });
+    }
+    Ok(byte_count)
+}
+
+fn write_capture_png(
+    path: &Path,
+    extent: vk::Extent2D,
+    format: vk::Format,
+    mut pixels: Vec<u8>,
+) -> Result<()> {
+    if matches!(
+        format,
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB
+    ) {
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    } else if !matches!(
+        format,
+        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB
+    ) {
+        return Err(VulkanRendererError::UnsupportedCaptureFormat(format));
+    }
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|source| VulkanRendererError::CaptureIo {
+            path: path.to_owned(),
+            source,
+        })?;
+    }
+    let file = std::fs::File::create(path).map_err(|source| VulkanRendererError::CaptureIo {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), extent.width, extent.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()?
+        .write_image_data(&pixels)
+        .map_err(VulkanRendererError::CapturePng)
 }
 
 unsafe extern "system" fn vulkan_debug_callback(
@@ -1026,4 +1287,39 @@ unsafe extern "system" fn vulkan_debug_callback(
         warn!(target: "vulkan::validation", "{message}");
     }
     vk::FALSE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_CAPTURE_BYTES, VulkanRendererError, capture_byte_count};
+    use ash::vk;
+
+    #[test]
+    fn swapchain_capture_size_is_checked_before_allocation() {
+        assert_eq!(
+            capture_byte_count(vk::Extent2D {
+                width: 1280,
+                height: 720,
+            })
+            .unwrap(),
+            1280 * 720 * 4
+        );
+        assert!(matches!(
+            capture_byte_count(vk::Extent2D {
+                width: 0,
+                height: 720,
+            }),
+            Err(VulkanRendererError::InvalidCaptureExtent)
+        ));
+        assert!(matches!(
+            capture_byte_count(vk::Extent2D {
+                width: 16384,
+                height: 16384,
+            }),
+            Err(VulkanRendererError::CaptureTooLarge {
+                limit: MAX_CAPTURE_BYTES,
+                ..
+            })
+        ));
+    }
 }
