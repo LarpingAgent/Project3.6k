@@ -2,44 +2,47 @@
 
 ## Current initialization
 
-1. Dynamically load the Vulkan loader through `ash`, create the native surface, and select a graphics/present queue.
-2. Create the swapchain, per-image depth attachments/framebuffers, and two frames in flight.
-3. Start one bounded CPU glTF worker. It imports the four licensed static reference models while the renderer prepares GPU resources.
-4. Upload model vertex/index buffers through host-visible staging into device-local allocations. Decode and resize limits remain in `project3-6k-assets`; this crate owns Vulkan images, samplers, buffers, cache entries, and destruction.
-5. Upload external base-color, normal, metallic-roughness, and AO data. Color/emissive maps use sRGB images with linear-light mip reduction. Normal maps use linear UNORM images and vector-aware mip reduction. Metallic-roughness and AO use linear UNORM data and data-space mip reduction.
-6. Load the Poly Haven forest-ground color, OpenGL normal, and ARM maps into a tiled technical ground plane. Build PBR descriptors, initialize per-frame scene uniforms, and record indexed draws for the external models into a linear FP16 HDR target per swapchain image.
-7. Sample the completed HDR target in a fullscreen pass, apply fitted ACES tone mapping, and write the display-ready result into the sRGB/UNORM swapchain image.
+1. Dynamically load Vulkan through `ash`, create the native surface, and select a graphics/present queue.
+2. Create the swapchain, per-image depth and FP16 HDR targets, and two frames in flight.
+3. Start one bounded CPU glTF worker and import the four licensed static reference models. CPU parsing and image decoding stay in `project3-6k-assets`; Vulkan owns GPU upload and resource lifetime.
+4. Upload model buffers and PBR maps through temporary staging allocations. Color/emissive textures use sRGB formats; normal, metallic-roughness, and AO maps use linear formats and role-correct mip reduction.
+5. Upload the licensed forest-ground color, OpenGL normal, and ARM maps onto the tiled technical ground plane. Create material descriptors and per-frame scene uniforms.
+6. Render a 1024×1024 directional shadow depth map for the current frame, then render GGX PBR into the per-image `R16G16B16A16_SFLOAT` target while sampling that shadow map.
+7. Sample the HDR image in a fullscreen pass, apply fitted ACES tone mapping, and present to the swapchain.
 
-The CPU importer accepts bounded local glTF 2.0 and GLB static triangle data, retains node transforms and PBR maps, and rejects unsupported deformation, line/point primitives, and external paths that escape the model directory. `AsyncModelLoader` bounds both queues. The current scene waits for its startup requests; asynchronous runtime loading and streaming are not implemented.
+The CPU importer accepts bounded local glTF 2.0 and GLB static triangle data, retains node transforms and PBR maps, and rejects unsupported deformation, line/point primitives, and external paths that escape the model directory. `AsyncModelLoader` bounds the CPU work queue, but the current startup waits for all four imports and uploads synchronously on the renderer thread. Runtime asset streaming is not implemented.
 
-The Vulkan GPU cache allows up to 32 models and 256 MiB of estimated resident model buffers and texture mip data. Generational handles reject stale references. Upload staging allocations are temporary. Cache entries and their RAII resource wrappers are released after the renderer waits for device idle. The current unload API is explicitly named `unload_after_device_idle`; callers must honor that lifetime precondition. Swapchain resize destroys framebuffers and scene resources after an idle wait, then rebuilds them.
+The Vulkan GPU cache allows up to 32 models and 256 MiB of estimated resident model buffers and texture mip data. Generational handles reject stale references. Upload staging allocations are temporary. Cache entries and RAII resources are released after device idle; callers of `unload_after_device_idle` must honor that lifetime precondition. A redundant same-size window event is ignored to avoid unnecessary scene reloads. A real extent change still recreates the current scene and can repeat its synchronous asset load; persistent GPU assets across resize remain future work.
 
-Imported materials currently support `TEXCOORD_0`, opaque and alpha-mask modes, base color, metallic, roughness, normal scale, AO strength, emissive, and double-sided normal handling. Alpha blend and alternate texture coordinate sets return typed errors instead of silently rendering incorrectly. The PBR fragment shader evaluates a GGX microfacet sun response and a restrained ambient term, applies normal mapping, and writes linear radiance to an `R16G16B16A16_SFLOAT` target. A separate fullscreen pass applies fitted ACES tone mapping before presentation; UNORM swapchains receive explicit output gamma conversion.
+Imported materials currently support `TEXCOORD_0`, opaque and alpha-mask modes, base color, metallic, roughness, normal scale, AO strength, emissive, and double-sided normal handling. Alpha blend and alternate texture coordinate sets return typed errors instead of silently rendering incorrectly. The PBR fragment shader evaluates a GGX sun response, four-tap comparison-filtered shadows, a restrained ambient term, normal mapping, and distance fog. It writes linear radiance to FP16 HDR; a separate pass applies ACES tone mapping before presentation.
 
-## Rendering status and dependencies
+## Rendering dependency graph
 
 ```mermaid
 flowchart LR
   CPU[glTF decode + validation] -->|CpuModelAsset| GPU[bounded Vulkan asset cache]
-  GPU --> Scene[PBR reference scene]
+  GPU --> Shadow[directional shadow depth pass]
+  Shadow --> Scene[PBR reference scene]
+  GPU --> Scene
   Scene --> HDR[per-image FP16 HDR target]
   HDR --> ToneMap[fullscreen ACES tone mapping]
   ToneMap --> LDR[LDR swapchain output]
   LDR --> Capture[optional PNG readback]
-  Scene -. next .-> Shadow[directional shadow map]
 ```
 
-Current renderer features: external glTF/GLB and raster import; role-correct PBR texture formats and mipmaps; device-local mesh uploads; GPU cache budget and RAII lifetime; directional sunlight; GGX PBR; alpha-masked foliage; depth testing; and PNG swapchain readback.
+Implemented: external glTF/GLB and raster import; role-correct PBR texture formats and mipmaps; device-local mesh uploads; bounded GPU cache and RAII lifetime; directional sunlight; GGX PBR; alpha-masked foliage; 1024² single-map directional shadows with four comparison taps; distance fog; FP16 HDR; ACES tone mapping; and opt-in PNG swapchain readback.
 
-Current HDR path: one linear FP16 target per swapchain image and a separate fitted-ACES presentation pass. Not yet implemented: directional shadow maps/cascades, atmospheric fog, material blending, alternative UV sets, GPU asset streaming, and world/terrain streaming. The scene does not yet include environment image-based lighting, so its ambient term is a restrained approximation.
+Still open: cascaded shadows, environment image-based lighting, full terrain/forest generation, LOD and frustum culling, instanced vegetation, material blending, alternate UV sets, asynchronous GPU uploads, and world/asset streaming. The current shadow map covers one scene-sized area and is not a cascaded production solution. Ambient light is a restrained approximation without environment lighting.
 
-## Frame submission and capture
+## Visual verification and performance
 
-The renderer has two frames in flight. It waits on the frame fence before updating that frame's scene uniform, acquires an image, waits for the prior image owner, records the scene, submits, and presents with image-indexed semaphores. When capture is requested and the surface supports `TRANSFER_SRC`, the captured swapchain image is copied to a bounded host-visible buffer, mapped after the fence, invalidated if non-coherent, converted from BGRA where needed, and encoded to PNG. Capture stalls one frame and is opt-in.
+The baseline is [baseline-before-rendering-upgrade.png](../../artifacts/visual-verification/baseline-before-rendering-upgrade.png). The PBR stage is [pbr-foundation-stage-3.png](../../artifacts/visual-verification/pbr-foundation-stage-3.png), HDR/tone mapping is [hdr-stage-1.png](../../artifacts/visual-verification/hdr-stage-1.png), and the Release build shadow capture is [release-shadow-reference.png](../../artifacts/visual-verification/release-shadow-reference.png). The 1280×720 Release capture was opened and inspected; it shows the external ground, stump, rocks, dead trunk, shrubs, and cast shadows. The current reference scene remains sparse, with a flat ground plane and visible shadow aliasing; no claim of finished game-level realism is made.
 
-The pre-upgrade comparison is [baseline-before-rendering-upgrade.png](../../artifacts/visual-verification/baseline-before-rendering-upgrade.png). The PBR foundation output is [pbr-foundation-stage-3.png](../../artifacts/visual-verification/pbr-foundation-stage-3.png). The HDR/tone-mapping output is [hdr-stage-1.png](../../artifacts/visual-verification/hdr-stage-1.png). Both current captures were opened and visually checked at 1280×720. The PBR capture shows imported models, tiled ground material, map response, and directional lighting; the HDR capture shows the FP16 path and tone-mapped output. The scene has no cast shadows and remains sparse, so those are open visual gaps.
+Measured on an NVIDIA GeForce GTX 1660 SUPER at 1280×720 using the Windows Release build, without capture, over 600 submitted frames: rolling batches reported 74.3–78.5 FPS, 12.7–13.5 ms average frame interval, p95 14.7–15.6 ms, and maximum 15.6–31.6 ms. App startup to first rendered-ready scene was about 1.67 seconds: CPU model import about 0.23 seconds, model GPU uploads about 0.63 seconds, and ground/renderer setup about 0.32 seconds. Resident model buffers and model texture mips were reported as 74,038,860 bytes; ground GPU resources were 16,777,212 bytes. A cold first Release build took 86.1 seconds; the warm incremental dev build took 2.85 seconds. These are one-machine measurements, not cross-GPU guarantees. Screenshot capture deliberately stalls a frame and must not be used for performance timing.
 
-For local verification, set `VULKAN_SDK` to a Vulkan SDK that includes `glslc`, then run:
+## Local verification
+
+Set `VULKAN_SDK` to an SDK that provides `glslc`, then run from the repository root:
 
 ```powershell
 cargo test --workspace
@@ -47,11 +50,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p project3-6k-app -- --run-frames 5 --validation --capture-frame artifacts/visual-verification/current.png
 ```
 
-The Vulkan run exercises the native application, external asset import, upload, rendering, validation callback, GPU readback, and shutdown. A successful compile alone does not verify rendered pixels. The optional screenshot command intentionally stalls the captured frame; do not use that frame for performance measurements.
+The Vulkan run opens the native application, loads external assets, renders, captures a real swapchain frame, checks validation, and exits. Compilation alone does not verify pixels. To inspect runtime profiling, use `$env:RUST_LOG='debug'; cargo run -p project3-6k-app -- --run-frames 600` and read the rolling profiler lines or window title after startup.
 
-## Next implementation steps
+The current Release test executable is `target/release/project3-6k.exe`. Run it from this checkout so its external reference assets remain available. For interactive testing in PowerShell:
 
-1. Add a depth-only directional shadow pass, beginning with one shadow map and measured bias/PCF tuning; consider cascades only after visual validation.
-2. Compare screenshots and capture startup CPU import, GPU upload/resident bytes, and steady-state frame timing. Improve scene composition and evaluate a suitably sized licensed tree asset before broadening the reference scene.
+```powershell
+.\target\release\project3-6k.exe
+```
 
-See [Decision 0014](../decisions/0014-cpu-gltf-import.md) for CPU library selection, [Decision 0015](../decisions/0015-vulkan-pbr-foundation.md) for GPU upload/material/lifetime choices, and [Decision 0016](../decisions/0016-fp16-hdr-tone-mapping.md) for the HDR target and post-process pass.
+Click the window to capture the mouse, move with WASD, use Space/Shift to rise or descend, press Escape once to release the mouse, and press Escape again to close. This build loads the technical scene; it does not contain gameplay or a survival loop.
+
+See [Decision 0014](../decisions/0014-cpu-gltf-import.md) for the CPU import library choice, [Decision 0015](../decisions/0015-vulkan-pbr-foundation.md) for the GPU cache/material foundation, [Decision 0016](../decisions/0016-fp16-hdr-tone-mapping.md) for HDR and tone mapping, and [Decision 0017](../decisions/0017-directional-shadow-and-resize-startup.md) for the shadow pass and startup resize fix.

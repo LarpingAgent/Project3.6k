@@ -10,11 +10,13 @@ layout(location = 4) in vec4 vertex_color;
 
 layout(set = 0, binding = 0) uniform SceneUniform {
     mat4 view_projection;
+    mat4 sun_view_projection;
     vec4 camera_position;
     vec4 sun_direction;
     vec4 sun_color;
     vec4 ambient_color;
 } scene;
+layout(set = 0, binding = 1) uniform sampler2DShadow directional_shadow_map;
 
 layout(set = 1, binding = 0) uniform sampler2D base_color_map;
 layout(set = 1, binding = 1) uniform sampler2D normal_map;
@@ -47,6 +49,29 @@ float geometry_schlick_ggx(float n_dot_v, float roughness) {
 
 vec3 fresnel_schlick(float cosine, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cosine, 0.0, 1.0), 5.0);
+}
+
+float sun_visibility(vec3 position, vec3 normal, vec3 light) {
+    vec4 shadow_clip = scene.sun_view_projection * vec4(position + normal * 0.015, 1.0);
+    if (shadow_clip.w <= 0.0) {
+        return 1.0;
+    }
+    vec3 shadow_position = shadow_clip.xyz / shadow_clip.w;
+    vec2 uv = shadow_position.xy * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0
+        || shadow_position.z < 0.0 || shadow_position.z > 1.0) {
+        return 1.0;
+    }
+
+    float bias = max(0.00035 * (1.0 - dot(normal, light)), 0.00008);
+    vec2 texel = 1.0 / vec2(textureSize(directional_shadow_map, 0));
+    float reference_depth = shadow_position.z - bias;
+    float visibility =
+        texture(directional_shadow_map, vec3(uv + texel * vec2(-0.5, -0.5), reference_depth))
+        + texture(directional_shadow_map, vec3(uv + texel * vec2(0.5, -0.5), reference_depth))
+        + texture(directional_shadow_map, vec3(uv + texel * vec2(-0.5, 0.5), reference_depth))
+        + texture(directional_shadow_map, vec3(uv + texel * vec2(0.5, 0.5), reference_depth));
+    return visibility * 0.25;
 }
 
 vec3 evaluate_sun(vec3 normal, vec3 view, vec3 light, vec3 albedo, float metallic, float roughness) {
@@ -92,10 +117,14 @@ void main() {
     vec3 view = normalize(scene.camera_position.xyz - world_position);
     vec3 light = normalize(scene.sun_direction.xyz);
 
-    vec3 direct = evaluate_sun(normal, view, light, base.rgb, metallic, roughness);
+    float visibility = sun_visibility(world_position, normal, light);
+    vec3 direct = evaluate_sun(normal, view, light, base.rgb, metallic, roughness) * visibility;
     float hemi = 0.45 + 0.55 * max(normal.y, 0.0);
     vec3 ambient = scene.ambient_color.rgb * hemi * base.rgb * ao;
     vec3 emissive = texture(emissive_map, texture_uv).rgb * material.emissive_factor.rgb;
     vec3 hdr_color = direct + ambient + emissive;
+    float camera_distance = length(scene.camera_position.xyz - world_position);
+    float fog = 1.0 - exp(-camera_distance * camera_distance * 0.0018);
+    hdr_color = mix(hdr_color, vec3(0.05, 0.08, 0.07), fog);
     out_color = vec4(max(hdr_color, vec3(0.0)), base.a);
 }

@@ -12,7 +12,7 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 ## Phase 4b renderer image evidence
 
 - `cargo run -p project3-6k-app -- --run-frames 5 --validation --capture-frame artifacts/visual-verification/baseline-before-rendering-upgrade.png` captures one real swapchain frame and exits only after five submitted frames. This baseline was captured and opened successfully; inspect it before comparing later builds.
-- **NOT VERIFIED BY AUTOMATION** — After PBR/shadow changes, save a second PNG beside the baseline and compare surface maps, material response, shadow contrast, and foliage detail at the same window extent.
+- **VERIFIED** — [release-shadow-reference.png](../artifacts/visual-verification/release-shadow-reference.png) was captured from the Release Vulkan build at 1280×720 and opened for inspection. It shows real ground/model textures and cast shadows after the shadow pass was added.
 
 ## Rendering and asset foundation
 
@@ -21,16 +21,18 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 - `cargo run -p project3-6k-app -- --run-frames 5 --validation --capture-frame artifacts/visual-verification/current.png` opens the application, imports and uploads the external models/maps, renders, captures one swapchain frame, validates, and exits.
 - **VERIFIED** — [pbr-foundation-stage-3.png](../artifacts/visual-verification/pbr-foundation-stage-3.png) was captured from the running Vulkan application and opened at 1280×720. The floor, stump, rocks, upright trunk, foliage, PBR map response, and directional light are visible.
 - **VERIFIED** — [hdr-stage-1.png](../artifacts/visual-verification/hdr-stage-1.png) was captured from the native Vulkan application after rendering to an FP16 target and running the separate ACES tone-mapping pass. `--validation` completed with exit code 0.
-- **NOT VERIFIED / NOT IMPLEMENTED** — The HDR screenshot has no cast shadows or atmospheric fog; a shadow-map pass and further visual verification are still required.
-- **NOT VERIFIED BY AUTOMATION** — Check the technical scene on a second Vulkan GPU, inspect foliage alpha edges and texture tiling at multiple distances, and compare a capture after FP16 HDR and shadow-map work.
+- **VERIFIED** — `--validation` completed with exit code 0 for the shadow capture. Shadow map is a single 1024² map with four comparison taps; aliasing and lack of cascades remain visible limitations.
+- **VERIFIED** — 600 submitted frames on NVIDIA GeForce GTX 1660 SUPER, 1280×720 Windows Release build: 74.3–78.5 FPS across five rolling batches, 12.7–13.5 ms average interval, 14.7–15.6 ms p95. No screenshot readback was enabled for this measurement.
+- **VERIFIED** — A same-size resize notification no longer causes a second asset import/upload; the window system test reported one import cycle. Real size changes still rebuild the scene and may stall during synchronous loading.
+- **NOT VERIFIED BY AUTOMATION** — Check the technical scene on a second Vulkan GPU, inspect foliage alpha edges and texture tiling at multiple distances, and assess shadow aliasing/camera coverage by moving around the scene.
 
 ## Phase 2 application and window lifecycle
 
 - **NOT VERIFIED BY AUTOMATION** — Run `cargo run -p project3-6k-app`, confirm the window appears, press Escape, and confirm it closes cleanly.
 - **NOT VERIFIED BY AUTOMATION** — Close the window with its title-bar close button and confirm the same shutdown path completes.
-- **NOT VERIFIED BY AUTOMATION** — Resize the window repeatedly by dragging its edge and confirm it redraws at the new size without visible corruption.
+- **NOT VERIFIED BY AUTOMATION** — Resize the window repeatedly by dragging its edge and confirm it redraws at the new size without visible corruption. A real size change currently rebuilds the scene and reloads assets, so expect a startup-like hitch until persistent GPU assets are separated from swapchain resources.
 - **NOT VERIFIED BY AUTOMATION** — Minimize and restore the window; confirm drawing suspends while minimized and resumes after restore.
-- **NOT VERIFIED BY AUTOMATION** — Confirm the low-poly forest geometry appears over the forest-colored background and the window remains responsive during a long run.
+- **VERIFIED** — Automated 600-frame run completed cleanly. The initial scene setup still blocks the window while its four CPU imports and GPU uploads complete (about 10.3 seconds on the recorded machine).
 
 ## Phase 3c first-person camera
 
@@ -50,7 +52,7 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 
 ## Phase 3f basic lighting
 
-- **NOT VERIFIED BY AUTOMATION** — Confirm the two folded faces on each canopy show different brightness, trunks and ground remain visible under the ambient floor, and lighting stays fixed in world space while the camera turns. Cast shadows are not implemented.
+- **NOT VERIFIED BY AUTOMATION** — Confirm the two folded faces on each canopy show different brightness, trunks and ground remain visible under the ambient floor, lighting stays fixed in world space while the camera turns, and the single-map cast shadows remain stable while moving.
 - **NOT VERIFIED BY AUTOMATION** — Move around the scene and resize the window; confirm normals do not produce abrupt shading seams or black faces.
 
 ## Phase 4 profiling and debug display

@@ -7,7 +7,7 @@ use std::{
 };
 
 use ash::vk;
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat4, Quat, Vec3, Vec4};
 use project3_6k_assets::{
     AlphaMode, AsyncModelLoader, CpuMaterialAsset, ModelImportLimits, TextureAsset, TextureBinding,
     TextureMipMode, import_image,
@@ -22,18 +22,23 @@ use super::{
         upload_gpu_mesh,
     },
     gpu_resources::{BufferAllocation, TextureResource},
+    shadow_target::{SHADOW_MAP_EXTENT, ShadowTarget},
 };
 
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.vert.spv"));
 const FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forest.frag.spv"));
+const SHADOW_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
+const SHADOW_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));
 const MATERIAL_TEXTURE_COUNT: usize = 5;
 const PUSH_CONSTANT_BYTES: u32 = 128;
 const MODEL_IDS: [&str; 4] = ["tree_stump_01", "rock_09", "dead_tree_trunk_02", "shrub_03"];
 const SUN_DIRECTION: Vec3 = Vec3::new(-0.43, 0.82, 0.38);
+const SUN_TARGET: Vec3 = Vec3::new(0.0, 0.5, -2.5);
 
 #[repr(C, align(16))]
 struct SceneUniform {
     view_projection: [[f32; 4]; 4],
+    sun_view_projection: [[f32; 4]; 4],
     camera_position: [f32; 4],
     sun_direction: [f32; 4],
     sun_color: [f32; 4],
@@ -72,6 +77,16 @@ struct FallbackTextures {
     emissive: TextureResource,
 }
 
+pub(super) struct ForestSceneInit<'a> {
+    pub(super) render_pass: vk::RenderPass,
+    pub(super) shadow_render_pass: vk::RenderPass,
+    pub(super) shadow_targets: &'a [ShadowTarget],
+    pub(super) graphics_queue: vk::Queue,
+    pub(super) queue_family_index: u32,
+    pub(super) srgb_format: vk::Format,
+    pub(super) linear_format: vk::Format,
+}
+
 pub(super) struct ForestScene {
     device: ash::Device,
     descriptor_set_layout: vk::DescriptorSetLayout,
@@ -81,6 +96,7 @@ pub(super) struct ForestScene {
     ground_material_set: vk::DescriptorSet,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    shadow_pipeline: vk::Pipeline,
     camera_buffers: Vec<BufferAllocation>,
     ground: Option<GroundResources>,
     fallbacks: Option<FallbackTextures>,
@@ -92,12 +108,17 @@ impl ForestScene {
     pub(super) fn new(
         device: &ash::Device,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
-        render_pass: vk::RenderPass,
-        graphics_queue: vk::Queue,
-        queue_family_index: u32,
-        srgb_format: vk::Format,
-        linear_format: vk::Format,
+        init: ForestSceneInit<'_>,
     ) -> Result<Self> {
+        let ForestSceneInit {
+            render_pass,
+            shadow_render_pass,
+            shadow_targets,
+            graphics_queue,
+            queue_family_index,
+            srgb_format,
+            linear_format,
+        } = init;
         let mut gpu_assets = GpuAssetCache::new(
             device,
             *memory_properties,
@@ -116,6 +137,7 @@ impl ForestScene {
             ground_material_set: vk::DescriptorSet::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
+            shadow_pipeline: vk::Pipeline::null(),
             camera_buffers: Vec::new(),
             ground: None,
             fallbacks: None,
@@ -152,9 +174,9 @@ impl ForestScene {
             )?);
         }
 
-        scene.create_layouts_and_pipeline(render_pass)?;
+        scene.create_layouts_and_pipeline(render_pass, shadow_render_pass)?;
         scene.create_model_placements(&model_handles)?;
-        scene.create_descriptors()?;
+        scene.create_descriptors(shadow_targets)?;
 
         let model_bytes = scene.gpu_assets.resident_gpu_bytes();
         let ground_bytes = scene.ground.as_ref().map_or(0, |ground| ground.gpu_bytes);
@@ -163,6 +185,7 @@ impl ForestScene {
             placements = scene.models.len(),
             gpu_model_bytes = model_bytes,
             gpu_ground_bytes = ground_bytes,
+            shadow_map_resolution = SHADOW_MAP_EXTENT,
             "PBR reference scene uploaded"
         );
         Ok(scene)
@@ -177,6 +200,7 @@ impl ForestScene {
         let sun_direction = SUN_DIRECTION.normalize();
         let uniform = SceneUniform {
             view_projection,
+            sun_view_projection: sun_view_projection().to_cols_array_2d(),
             camera_position: [
                 camera_position[0],
                 camera_position[1],
@@ -188,6 +212,103 @@ impl ForestScene {
             ambient_color: [0.10, 0.12, 0.15, 1.0],
         };
         self.camera_buffers[frame_index].upload(struct_bytes(&uniform))
+    }
+
+    pub(super) fn record_shadow_draw(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        extent: vk::Extent2D,
+        frame_index: usize,
+    ) {
+        let viewport = [vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: extent.width as f32,
+            height: extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        let scissor = [vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        }];
+        let scene_set = [self.scene_descriptor_sets[frame_index]];
+        // SAFETY: The depth-only render pass is active and per-frame resources are fence-safe.
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.shadow_pipeline,
+            );
+            self.device.cmd_set_viewport(command_buffer, 0, &viewport);
+            self.device.cmd_set_scissor(command_buffer, 0, &scissor);
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &scene_set,
+                &[],
+            );
+        }
+        if let Some(ground) = &self.ground {
+            self.bind_draw_buffers(command_buffer, &ground.vertex_buffer, &ground.index_buffer);
+            let material_set = [self.ground_material_set];
+            // SAFETY: The material descriptor and 128-byte transform data match the shared layout.
+            unsafe {
+                self.device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    1,
+                    &material_set,
+                    &[],
+                );
+            }
+            self.push_material(command_buffer, Mat4::IDENTITY, &ground.material.source);
+            // SAFETY: The ground buffers contain a complete indexed plane and remain resident.
+            unsafe {
+                self.device
+                    .cmd_draw_indexed(command_buffer, ground.index_count, 1, 0, 0, 0);
+            }
+        }
+        for placed in &self.models {
+            let Some(model) = self.gpu_assets.model(placed.handle) else {
+                continue;
+            };
+            self.bind_draw_buffers(command_buffer, &model.vertex_buffer, &model.index_buffer);
+            for instance in &model.instances {
+                let model_to_world =
+                    placed.transform * Mat4::from_cols_array_2d(&instance.transform);
+                for draw in &model.draws {
+                    let material = &model.materials[draw.material_index];
+                    let descriptor_set = [placed.material_sets[draw.material_index]];
+                    // SAFETY: The material set provides its base-color map for alpha masking.
+                    unsafe {
+                        self.device.cmd_bind_descriptor_sets(
+                            command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.pipeline_layout,
+                            1,
+                            &descriptor_set,
+                            &[],
+                        );
+                    }
+                    self.push_material(command_buffer, model_to_world, &material.source);
+                    // SAFETY: This draw range references validated indices in the live model buffers.
+                    unsafe {
+                        self.device.cmd_draw_indexed(
+                            command_buffer,
+                            draw.index_count,
+                            1,
+                            draw.first_index,
+                            draw.vertex_offset,
+                            0,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn record_draw(
@@ -268,13 +389,24 @@ impl ForestScene {
         }
     }
 
-    fn create_layouts_and_pipeline(&mut self, render_pass: vk::RenderPass) -> Result<()> {
-        let scene_bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
-        // SAFETY: The scene layout owns one per-frame uniform visible to both shader stages.
+    fn create_layouts_and_pipeline(
+        &mut self,
+        render_pass: vk::RenderPass,
+        shadow_render_pass: vk::RenderPass,
+    ) -> Result<()> {
+        let scene_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        // SAFETY: The scene set contains its per-frame uniform and comparison shadow sampler.
         self.descriptor_set_layout = unsafe {
             self.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&scene_bindings),
@@ -410,6 +542,7 @@ impl ForestScene {
                 return Err(error.into());
             }
         };
+        self.create_shadow_pipeline(shadow_render_pass)?;
         Ok(())
     }
 
@@ -467,7 +600,101 @@ impl ForestScene {
         Ok(())
     }
 
-    fn create_descriptors(&mut self) -> Result<()> {
+    fn create_shadow_pipeline(&mut self, render_pass: vk::RenderPass) -> Result<()> {
+        let vertex_shader = ShaderModule::new(&self.device, SHADOW_VERTEX_SHADER)?;
+        let fragment_shader = ShaderModule::new(&self.device, SHADOW_FRAGMENT_SHADER)?;
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vertex_shader.handle)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment_shader.handle)
+                .name(c"main"),
+        ];
+        let vertex_bindings = [vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: size_of::<GpuVertex>() as u32,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }];
+        let vertex_attributes = [
+            vertex_attribute(
+                0,
+                vk::Format::R32G32B32_SFLOAT,
+                offset_of!(GpuVertex, position),
+            ),
+            vertex_attribute(3, vk::Format::R32G32_SFLOAT, offset_of!(GpuVertex, uv)),
+            vertex_attribute(
+                4,
+                vk::Format::R32G32B32A32_SFLOAT,
+                offset_of!(GpuVertex, color),
+            ),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vertex_bindings)
+            .vertex_attribute_descriptions(&vertex_attributes);
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+            .primitive_restart_enable(false);
+        let viewport = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .depth_bias_enable(true)
+            .depth_bias_constant_factor(1.25)
+            .depth_bias_slope_factor(1.75)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS)
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false);
+        let color_blending = vk::PipelineColorBlendStateCreateInfo::default();
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisampling)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blending)
+            .dynamic_state(&dynamic)
+            .layout(self.pipeline_layout)
+            .render_pass(render_pass)
+            .subpass(0)];
+        // SAFETY: The shader interfaces match the shared layouts and the depth-only render pass.
+        self.shadow_pipeline = match unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+        } {
+            Ok(mut pipelines) => pipelines.remove(0),
+            Err((pipelines, error)) => {
+                // SAFETY: Partial pipelines returned on failure belong to this logical device.
+                unsafe {
+                    for pipeline in pipelines {
+                        self.device.destroy_pipeline(pipeline, None);
+                    }
+                }
+                return Err(error.into());
+            }
+        };
+        Ok(())
+    }
+
+    fn create_descriptors(&mut self, shadow_targets: &[ShadowTarget]) -> Result<()> {
+        if shadow_targets.len() != FRAMES_IN_FLIGHT {
+            return Err(VulkanRendererError::InvalidShadowTargets);
+        }
         let material_set_count = self.models.iter().try_fold(1usize, |sum, placed| {
             let model = self
                 .gpu_assets
@@ -478,6 +705,7 @@ impl ForestScene {
         })?;
         let material_descriptor_count = material_set_count
             .checked_mul(MATERIAL_TEXTURE_COUNT)
+            .and_then(|count| count.checked_add(shadow_targets.len()))
             .and_then(|count| u32::try_from(count).ok())
             .ok_or(VulkanRendererError::GpuAssetSizeOverflow)?;
         let pool_sizes = [
@@ -494,7 +722,7 @@ impl ForestScene {
             .checked_add(material_set_count)
             .and_then(|count| u32::try_from(count).ok())
             .ok_or(VulkanRendererError::GpuAssetSizeOverflow)?;
-        // SAFETY: Pool sizes cover all scene uniforms and five sampled maps per material set.
+        // SAFETY: Pool sizes cover all scene uniforms, shadow maps, and five sampled maps per material.
         self.descriptor_pool = unsafe {
             self.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -509,20 +737,34 @@ impl ForestScene {
             .set_layouts(&scene_layouts);
         // SAFETY: The descriptor pool and each requested scene set layout are live.
         self.scene_descriptor_sets = unsafe { self.device.allocate_descriptor_sets(&scene_info)? };
-        for (camera_buffer, descriptor_set) in
-            self.camera_buffers.iter().zip(&self.scene_descriptor_sets)
+        for ((camera_buffer, descriptor_set), shadow_target) in self
+            .camera_buffers
+            .iter()
+            .zip(&self.scene_descriptor_sets)
+            .zip(shadow_targets)
         {
             let buffer_info = [vk::DescriptorBufferInfo::default()
                 .buffer(camera_buffer.buffer)
                 .offset(0)
                 .range(size_of::<SceneUniform>() as u64)];
-            let write = [vk::WriteDescriptorSet::default()
-                .dst_set(*descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(&buffer_info)];
-            // SAFETY: This set references its own live host-visible scene uniform.
-            unsafe { self.device.update_descriptor_sets(&write, &[]) };
+            let image_info = [vk::DescriptorImageInfo::default()
+                .sampler(shadow_target.sampler)
+                .image_view(shadow_target.view)
+                .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*descriptor_set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&buffer_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&image_info),
+            ];
+            // SAFETY: The set references its per-frame uniform and fence-safe shadow target.
+            unsafe { self.device.update_descriptor_sets(&writes, &[]) };
         }
 
         let material_layouts = vec![self.material_set_layout; material_set_count];
@@ -712,6 +954,9 @@ impl Drop for ForestScene {
         unsafe {
             if self.pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.pipeline, None);
+            }
+            if self.shadow_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.shadow_pipeline, None);
             }
             if self.descriptor_pool != vk::DescriptorPool::null() {
                 self.device
@@ -993,6 +1238,22 @@ fn texture_info(
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
 }
 
+fn sun_view_projection() -> Mat4 {
+    let direction = SUN_DIRECTION.normalize();
+    let eye = SUN_TARGET + direction * 25.0;
+    let view = glam::camera::rh::view::look_at_mat4(eye, SUN_TARGET, Vec3::Y);
+    let radius = 14.0;
+    let near = 0.1;
+    let far = 50.0;
+    let projection = Mat4::from_cols(
+        Vec4::new(1.0 / radius, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, -1.0 / radius, 0.0, 0.0),
+        Vec4::new(0.0, 0.0, 1.0 / (near - far), 0.0),
+        Vec4::new(0.0, 0.0, near / (near - far), 1.0),
+    );
+    projection * view
+}
+
 fn vertex_attribute(
     location: u32,
     format: vk::Format,
@@ -1034,5 +1295,31 @@ impl Drop for ShaderModule {
     fn drop(&mut self) {
         // SAFETY: The shader module is owned here and pipelines are created before this local drops.
         unsafe { self.device.destroy_shader_module(self.handle, None) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SUN_TARGET, sun_view_projection};
+    use glam::Vec3;
+
+    #[test]
+    fn directional_shadow_projection_covers_the_reference_scene_in_vulkan_depth() {
+        let projection = sun_view_projection();
+        let target = projection.project_point3(SUN_TARGET);
+        assert!(target.x.abs() < 0.0001);
+        assert!(target.y.abs() < 0.0001);
+        assert!((0.0..1.0).contains(&target.z));
+
+        for point in [
+            Vec3::new(-4.0, 0.0, -7.0),
+            Vec3::new(4.0, 2.2, -7.5),
+            Vec3::new(0.0, 0.0, 0.0),
+        ] {
+            let mapped = projection.project_point3(point);
+            assert!((-1.0..=1.0).contains(&mapped.x), "{point:?} -> {mapped:?}");
+            assert!((-1.0..=1.0).contains(&mapped.y), "{point:?} -> {mapped:?}");
+            assert!((0.0..=1.0).contains(&mapped.z), "{point:?} -> {mapped:?}");
+        }
     }
 }

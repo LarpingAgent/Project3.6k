@@ -9,29 +9,6 @@ pub(super) struct DepthAttachment {
     pub(super) view: vk::ImageView,
 }
 
-pub(super) fn choose_depth_format(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
-) -> Result<vk::Format> {
-    for format in [
-        vk::Format::D32_SFLOAT,
-        vk::Format::D32_SFLOAT_S8_UINT,
-        vk::Format::D24_UNORM_S8_UINT,
-        vk::Format::D16_UNORM,
-    ] {
-        // SAFETY: The physical device belongs to the live instance.
-        let properties =
-            unsafe { instance.get_physical_device_format_properties(physical_device, format) };
-        if properties
-            .optimal_tiling_features
-            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
-        {
-            return Ok(format);
-        }
-    }
-    Err(VulkanRendererError::NoSupportedDepthFormat)
-}
-
 impl DepthAttachment {
     pub(super) fn new(
         device: &ash::Device,

@@ -6,7 +6,7 @@ use std::{
 use ash::{Entry, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use winit::window::Window;
 
 #[path = "validation.rs"]
@@ -26,12 +26,15 @@ mod gpu_asset_cache;
 mod gpu_resources;
 #[path = "hdr_target.rs"]
 mod hdr_target;
+#[path = "shadow_target.rs"]
+mod shadow_target;
 #[path = "tone_map.rs"]
 mod tone_map;
 
-use depth_buffer::{DepthAttachment, choose_depth_format};
-use forest_scene::ForestScene;
+use depth_buffer::DepthAttachment;
+use forest_scene::{ForestScene, ForestSceneInit};
 use hdr_target::HdrTarget;
+use shadow_target::{SHADOW_MAP_EXTENT, ShadowTarget, choose_shadow_depth_format};
 use tone_map::ToneMapPass;
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
@@ -57,10 +60,10 @@ pub enum VulkanRendererError {
     NoPresentModes,
     #[error("the presentation surface does not support color-attachment images")]
     UnsupportedSurfaceUsage,
-    #[error("the selected Vulkan device has no supported depth attachment format")]
-    NoSupportedDepthFormat,
     #[error("the selected Vulkan device has no filterable FP16 color-attachment format for HDR")]
     NoSupportedHdrFormat,
+    #[error("the selected Vulkan device has no depth format that supports depth sampling")]
+    NoSupportedShadowFormat,
     #[error("the selected Vulkan device has no linearly-filterable sRGB texture format")]
     NoSupportedTextureFormat,
     #[error("the selected Vulkan device has no linearly-filterable RGBA8 data texture format")]
@@ -136,6 +139,8 @@ pub enum VulkanRendererError {
     UnsupportedBlendMaterial,
     #[error("the tone-mapping pass received no HDR targets")]
     InvalidToneMapTargets,
+    #[error("the shadow pass received an invalid number of per-frame targets")]
+    InvalidShadowTargets,
 }
 
 type Result<T> = std::result::Result<T, VulkanRendererError>;
@@ -433,8 +438,10 @@ struct SwapchainState {
     image_views: Vec<vk::ImageView>,
     hdr_render_pass: vk::RenderPass,
     present_render_pass: vk::RenderPass,
+    shadow_render_pass: vk::RenderPass,
     depth_images: Vec<DepthAttachment>,
     hdr_targets: Vec<HdrTarget>,
+    shadow_targets: Vec<ShadowTarget>,
     forest_scene: Option<ForestScene>,
     tone_map: Option<ToneMapPass>,
     hdr_framebuffers: Vec<vk::Framebuffer>,
@@ -471,8 +478,10 @@ impl SwapchainState {
             image_views: Vec::new(),
             hdr_render_pass: vk::RenderPass::null(),
             present_render_pass: vk::RenderPass::null(),
+            shadow_render_pass: vk::RenderPass::null(),
             depth_images: Vec::new(),
             hdr_targets: Vec::new(),
+            shadow_targets: Vec::new(),
             forest_scene: None,
             tone_map: None,
             hdr_framebuffers: Vec::new(),
@@ -525,7 +534,7 @@ impl SwapchainState {
         self.readback_supported = capabilities
             .supported_usage_flags
             .contains(vk::ImageUsageFlags::TRANSFER_SRC);
-        self.depth_format = choose_depth_format(&context.instance, context.physical_device)?;
+        self.depth_format = choose_shadow_depth_format(&context.instance, context.physical_device)?;
         self.extent = choose_extent(&capabilities, window);
 
         let mut image_count = capabilities.min_image_count.saturating_add(1);
@@ -560,6 +569,7 @@ impl SwapchainState {
         self.hdr_render_pass =
             create_hdr_render_pass(&self.device, self.hdr_format, self.depth_format)?;
         self.present_render_pass = create_present_render_pass(&self.device, self.format)?;
+        self.shadow_render_pass = create_shadow_render_pass(&self.device, self.depth_format)?;
         // SAFETY: The physical device belongs to the live Vulkan instance.
         let memory_properties = unsafe {
             context
@@ -583,14 +593,26 @@ impl SwapchainState {
                 self.hdr_format,
             )?);
         }
+        for _ in 0..FRAMES_IN_FLIGHT {
+            self.shadow_targets.push(ShadowTarget::new(
+                &self.device,
+                &memory_properties,
+                self.depth_format,
+                self.shadow_render_pass,
+            )?);
+        }
         self.forest_scene = Some(ForestScene::new(
             &self.device,
             &memory_properties,
-            self.hdr_render_pass,
-            context.graphics_queue,
-            context.queue_family_index,
-            texture_format,
-            linear_texture_format,
+            ForestSceneInit {
+                render_pass: self.hdr_render_pass,
+                shadow_render_pass: self.shadow_render_pass,
+                shadow_targets: &self.shadow_targets,
+                graphics_queue: context.graphics_queue,
+                queue_family_index: context.queue_family_index,
+                srgb_format: texture_format,
+                linear_format: linear_texture_format,
+            },
         )?);
         for image in &self.images {
             let view_info = vk::ImageViewCreateInfo::default()
@@ -773,6 +795,12 @@ impl SwapchainState {
                 hdr_framebuffer: self.hdr_framebuffers[image_index],
                 present_render_pass: self.present_render_pass,
                 present_framebuffer: self.present_framebuffers[image_index],
+                shadow_render_pass: self.shadow_render_pass,
+                shadow_framebuffer: self.shadow_targets[self.current_frame].framebuffer,
+                shadow_extent: vk::Extent2D {
+                    width: SHADOW_MAP_EXTENT,
+                    height: SHADOW_MAP_EXTENT,
+                },
                 swapchain_image: self.images[image_index],
                 readback_buffer: readback_buffer.as_ref().map(|buffer| buffer.buffer),
                 frame_index: self.current_frame,
@@ -890,6 +918,7 @@ impl SwapchainState {
             }
             self.tone_map.take();
             self.forest_scene.take();
+            self.shadow_targets.clear();
             self.hdr_targets.clear();
             self.depth_images.clear();
             for image_view in self.image_views.drain(..).rev() {
@@ -903,6 +932,11 @@ impl SwapchainState {
             if self.hdr_render_pass != vk::RenderPass::null() {
                 self.device.destroy_render_pass(self.hdr_render_pass, None);
                 self.hdr_render_pass = vk::RenderPass::null();
+            }
+            if self.shadow_render_pass != vk::RenderPass::null() {
+                self.device
+                    .destroy_render_pass(self.shadow_render_pass, None);
+                self.shadow_render_pass = vk::RenderPass::null();
             }
             if self.swapchain != vk::SwapchainKHR::null() {
                 self.loader.destroy_swapchain(self.swapchain, None);
@@ -997,9 +1031,22 @@ impl VulkanRenderer {
     /// Marks the swapchain for recreation after a native window resize.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.suspended = width == 0 || height == 0;
-        if !self.suspended {
-            self.resized = true;
+        if self.suspended {
+            debug!(width, height, "swapchain suspended for zero-sized window");
+            return;
         }
+        // Window systems can report the already-active client extent during startup and after
+        // focus/DPI notifications. Recreating for those no-op events re-imports and re-uploads
+        // every scene asset, which can stall the UI for several seconds.
+        self.resized = extent_changed(self.swapchain.extent, width, height);
+        debug!(
+            width,
+            height,
+            current_width = self.swapchain.extent.width,
+            current_height = self.swapchain.extent.height,
+            recreate = self.resized,
+            "window resize received"
+        );
     }
 
     /// Acquires, records the forest scene, submits, and presents one frame.
@@ -1134,6 +1181,10 @@ fn choose_extent(capabilities: &vk::SurfaceCapabilitiesKHR, window: &Window) -> 
     }
 }
 
+fn extent_changed(current: vk::Extent2D, width: u32, height: u32) -> bool {
+    current.width != width || current.height != height
+}
+
 fn choose_composite_alpha(supported: vk::CompositeAlphaFlagsKHR) -> vk::CompositeAlphaFlagsKHR {
     [
         vk::CompositeAlphaFlagsKHR::OPAQUE,
@@ -1258,11 +1309,61 @@ fn create_present_render_pass(device: &ash::Device, format: vk::Format) -> Resul
     Ok(unsafe { device.create_render_pass(&info, None)? })
 }
 
+fn create_shadow_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::RenderPass> {
+    let attachments = [vk::AttachmentDescription::default()
+        .format(format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)];
+    let depth = vk::AttachmentReference {
+        attachment: 0,
+        layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
+    let subpasses = [vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .depth_stencil_attachment(&depth)];
+    let dependencies = [
+        vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .dst_stage_mask(
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            )
+            .src_access_mask(vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+        vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            )
+            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ),
+    ];
+    let info = vk::RenderPassCreateInfo::default()
+        .attachments(&attachments)
+        .subpasses(&subpasses)
+        .dependencies(&dependencies);
+    // SAFETY: A depth-only pass transitions its stored depth image to a read-only sampled layout.
+    Ok(unsafe { device.create_render_pass(&info, None)? })
+}
+
 struct ScenePassTarget {
     hdr_render_pass: vk::RenderPass,
     hdr_framebuffer: vk::Framebuffer,
     present_render_pass: vk::RenderPass,
     present_framebuffer: vk::Framebuffer,
+    shadow_render_pass: vk::RenderPass,
+    shadow_framebuffer: vk::Framebuffer,
+    shadow_extent: vk::Extent2D,
     swapchain_image: vk::Image,
     readback_buffer: Option<vk::Buffer>,
     frame_index: usize,
@@ -1283,10 +1384,31 @@ fn record_scene_pass(
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         device.begin_command_buffer(command_buffer, &begin_info)?;
+        let shadow_clear = [vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        }];
+        let shadow_pass_info = vk::RenderPassBeginInfo::default()
+            .render_pass(target.shadow_render_pass)
+            .framebuffer(target.shadow_framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: target.shadow_extent,
+            })
+            .clear_values(&shadow_clear);
+        device.cmd_begin_render_pass(
+            command_buffer,
+            &shadow_pass_info,
+            vk::SubpassContents::INLINE,
+        );
+        scene.record_shadow_draw(command_buffer, target.shadow_extent, target.frame_index);
+        device.cmd_end_render_pass(command_buffer);
         let clear_values = [
             vk::ClearValue {
                 color: vk::ClearColorValue {
-                    float32: [0.04, 0.075, 0.06, 1.0],
+                    float32: [0.05, 0.08, 0.07, 1.0],
                 },
             },
             vk::ClearValue {
@@ -1504,7 +1626,7 @@ unsafe extern "system" fn vulkan_debug_callback(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CAPTURE_BYTES, VulkanRendererError, capture_byte_count};
+    use super::{MAX_CAPTURE_BYTES, VulkanRendererError, capture_byte_count, extent_changed};
     use ash::vk;
 
     #[test]
@@ -1534,5 +1656,16 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn matching_window_extent_does_not_recreate_swapchain() {
+        let current = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        assert!(!extent_changed(current, 1280, 720));
+        assert!(extent_changed(current, 1280, 721));
+        assert!(extent_changed(current, 1024, 640));
     }
 }
