@@ -6,7 +6,9 @@ Project3.6k is a custom Rust engine foundation for a future first-person forest 
 
 - Cargo workspace with focused `assets`, `core`, `platform`, `vulkan`, and `app` crates.
 - Game texture sources live under the workspace-level `assets/` directory.
-- Renderer-independent PNG texture loading with keyed handles, mip generation, and decoded-memory limits.
+- Renderer-independent raster texture decoding with dimension and byte limits.
+- Static glTF 2.0/GLB CPU import with mesh instances, generated normals/tangents, PBR factors, and base-color, metallic-roughness, normal, occlusion, and emissive map references.
+- Bounded CPU model cache and a single-thread asynchronous loader with back-pressure; Vulkan resources remain outside the `assets` crate.
 - Bounded mesh-instance scene data with scale/rotation/translation transforms, baked into the static forest mesh at initialization.
 - Native `winit` window and application lifecycle, paced at approximately 60 redraw requests per second.
 - Physical keyboard state, raw mouse input, cursor capture/release, and first-person WASD camera controls.
@@ -14,7 +16,7 @@ Project3.6k is a custom Rust engine foundation for a future first-person forest 
 - Debug builds require `VK_LAYER_KHRONOS_validation`; the callback counts and logs warnings/errors and makes the process fail if any occur.
 - Monotonic frame timing plus a fixed-size rolling profiler for FPS, average/p95/max frame interval, and renderer-call CPU time.
 
-The renderer builds a static spatial forest scene from a horizontal textured ground plane and shallow low-poly prisms for the trees and distant ridge. It uses indexed draws, a first-person perspective camera, per-swapchain depth testing, an embedded repeating sRGB noise texture with CPU-generated mipmaps, and ambient plus directional diffuse lighting. Vertex colors tint the texture. Interactive visual quality is still unverified; gameplay is future work.
+The current renderer still builds its original static spatial forest from authored low-poly geometry and an embedded repeating sRGB noise texture. The new CPU importer and PBR material data are not yet connected to Vulkan draws; GPU asset ownership, HDR/tone mapping, shadow maps, and the external-asset reference scene are subsequent verified steps. Interactive visual quality is still unverified; gameplay is outside this cycle.
 
 ## Requirements
 
@@ -42,7 +44,7 @@ Run the full Phase 2 validation smoke suite from PowerShell with `scripts/valida
 
 | Crate | Responsibility |
 |---|---|
-| `project3-6k-assets` | Bounded CPU-side PNG loading, keyed texture handles, mip generation, and cache lifetime management. |
+| `project3-6k-assets` | Bounded raster decoding, glTF/GLB CPU import, PBR material data, model/texture caches, and asynchronous CPU loading. |
 | `project3-6k-core` | Platform-neutral frame timing/profiling, camera math, bounded scene nodes, and transforms (`glam`). |
 | `project3-6k-platform` | `winit` event loop, window lifecycle, keyboard/mouse input, and camera controls. |
 | `project3-6k-vulkan` | Explicit Vulkan instance, surface, device, swapchain, color/depth attachments, synchronization, validation monitoring, per-frame camera uniforms, sampled textures, ambient/directional lighting, and indexed forest rendering. |

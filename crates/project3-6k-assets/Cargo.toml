@@ -6,5 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+base64.workspace = true
+glam.workspace = true
+gltf.workspace = true
+image.workspace = true
 png.workspace = true
 thiserror.workspace = true

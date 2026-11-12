@@ -2,6 +2,12 @@
 
 Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automated Vulkan checks are recorded in `target/validation-runs/` and are not a substitute for the checks below.
 
+## Phase 4a CPU asset pipeline
+
+- `cargo test -p project3-6k-assets` verifies glTF/GLB geometry, PBR map references, transforms, image decoding, memory bounds, model cache generations, and asynchronous worker completion.
+- **NOT VERIFIED BY AUTOMATION** — Import a licensed external glTF and GLB model with embedded and relative PNG/JPEG resources; confirm validation errors identify unsupported content and malformed external paths cleanly.
+- **NOT VERIFIED BY AUTOMATION** — Confirm each added asset has a source, author, license, and attribution record in `assets/ASSET_SOURCES.md`.
+
 ## Phase 2 application and window lifecycle
 
 - **NOT VERIFIED BY AUTOMATION** — Run `cargo run -p project3-6k-app`, confirm the window appears, press Escape, and confirm it closes cleanly.

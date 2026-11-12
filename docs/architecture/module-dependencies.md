@@ -4,7 +4,7 @@
 
 | Crate | Depends on | Public responsibility |
 |---|---|---|
-| `project3-6k-assets` | `png`, `thiserror` | Bounded PNG decoding, texture mip generation, and CPU asset cache |
+| `project3-6k-assets` | `base64`, `glam`, `gltf`, `image`, `png`, `thiserror` | Bounded raster decoding, static glTF/GLB CPU import, PBR material data, generational CPU model/texture caches, and bounded asynchronous model loading |
 | `project3-6k-core` | `glam`, `thiserror` | `FrameClock`, rolling frame profiler, camera math, bounded scene nodes, and transforms |
 | `project3-6k-vulkan` | `ash`, `ash-window`, `glam`, core, assets, `raw-window-handle`, `winit`, `thiserror`, `tracing` | `VulkanRenderer` initialization, transformed scene upload, color/depth attachments, texture upload, resize, and draw API |
 | `project3-6k-platform` | core, Vulkan, `winit`, `thiserror`, `tracing` | `run()`, keyboard/mouse `InputState`, and window controls |
@@ -23,8 +23,8 @@ flowchart BT
   app --> platform
 ```
 
-The platform crate coordinates core timing and Vulkan. Core does not know about windows, graphics, or application startup. Vulkan does not depend on input or game state. This prevents a cycle between engine subsystems.
+The platform crate coordinates core timing and Vulkan. Core does not know about windows, graphics, or application startup. Vulkan may consume CPU assets but the assets crate cannot import Vulkan or `ash`. This keeps file decoding separate from GPU resource management and prevents dependency cycles.
 
 ## Crates intentionally deferred
 
-There are no empty crates for scene, world, physics, audio, or debug UI. Assets now has a concrete CPU texture-loading and bounded-cache responsibility. Other crates should be added when their first concrete public interface is ready.
+There are no empty crates for scene, world, physics, audio, or debug UI. Assets has concrete CPU texture/model import and bounded cache responsibilities. GPU upload and resource lifetime stay in Vulkan. Other crates should be added when their first concrete public interface is ready.

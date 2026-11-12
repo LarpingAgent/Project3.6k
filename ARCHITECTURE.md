@@ -2,7 +2,7 @@
 
 ## Scope
 
-The current phase establishes a native application loop and a safe Vulkan presentation path. Gameplay, entity systems, physics, audio, world generation, and advanced rendering stay out of the foundation until their engine interfaces are justified.
+The current phase extends the native Rust + Vulkan (`ash`) renderer with a bounded CPU asset pipeline and a progressively verified PBR rendering foundation. Gameplay, survival systems, terrain generation, and multiplayer remain outside this phase.
 
 ## Runtime flow
 
@@ -11,17 +11,19 @@ flowchart TD
     App[project3-6k-app\nlogging + entry point] --> Platform[project3-6k-platform\nwinit lifecycle + input]
     Platform --> Core[project3-6k-core\nframe clock]
     Platform --> Vulkan[project3-6k-vulkan\nash + swapchain]
+    Assets[project3-6k-assets\nbounded CPU decoding + glTF/GLB import] --> Vulkan
     Platform --> Window[Native window]
     Vulkan --> Surface[Window surface]
     Vulkan --> GPU[Graphics and presentation queue]
-    GPU --> Swapchain[Acquire → clear + indexed forest draw → submit → present]
+    GPU --> Swapchain[Acquire → render scene → submit → present]
 ```
 
 ## Crate responsibilities and dependencies
 
 - `project3-6k-core` contains reusable engine primitives without platform or graphics dependencies.
 - `project3-6k-platform` owns the window, event loop, current keyboard state, frame pacing, and the renderer instance. It translates native events into engine-facing state.
-- `project3-6k-vulkan` owns Vulkan handles and performs explicit acquire, command recording, submit, and present operations. It has no dependency on gameplay or scene types.
+- `project3-6k-assets` parses external models and textures into bounded CPU data and never creates Vulkan handles.
+- `project3-6k-vulkan` owns Vulkan handles, GPU resource lifetime, render passes, and explicit acquire, command recording, submit, and present operations. It has no dependency on gameplay systems.
 - `project3-6k-app` initializes logging and starts the platform application.
 
 The dependency graph is one-way: app → platform → core and Vulkan. There are no circular crate dependencies. See [module-dependencies.md](docs/architecture/module-dependencies.md).
@@ -31,7 +33,7 @@ The dependency graph is one-way: app → platform → core and Vulkan. There are
 1. The platform event loop receives window and keyboard events.
 2. `about_to_wait` requests a redraw and waits until the next target frame interval.
 3. The Vulkan renderer waits for the current frame fence and acquires a swapchain image.
-4. It clears the acquired image and records indexed forest geometry with the GLSL graphics pipeline, submits work waiting on image acquisition, then presents after the image-specific render semaphore signals.
+4. It records the active scene with the GLSL graphics pipeline, submits work waiting on image acquisition, then presents after the image-specific render semaphore signals.
 5. Resize and out-of-date events wait for device idle and rebuild swapchain-owned resources.
 6. `--run-frames N` exits after N successful queue submissions; `--auto-close` exits after Vulkan initialization. `--resize-stress` exercises size changes and minimized-window suspension. All use the same event-loop and RAII shutdown path as a window close.
 
@@ -47,4 +49,4 @@ Gameplay state should remain separate from rendering and native input. Future ne
 
 ## Current limits
 
-The current renderer draws a static vertex-colored forest composition in clip space. It has no perspective camera, depth buffer, texture path, lighting, scene graph, or profiling overlay. The selected Vulkan API level is 1.0; optional modern rendering features can be evaluated when their requirements are concrete.
+The current renderer still draws the authored low-poly forest demo. The CPU asset crate now imports glTF 2.0/GLB geometry, node transforms, raster images, and metallic-roughness materials under explicit memory limits. The model data is not yet uploaded by Vulkan; subsequent steps add a GPU cache, PBR/HDR/shadow passes, and the external reference scene. Visual quality must be checked from rendered pixels, not compilation results.
