@@ -1,0 +1,18 @@
+# Decision 0018: Add a licensed pine group to the reference scene
+
+## Context
+
+The verified renderer scene had a flat ground plane, rocks, a stump, one dead trunk, and low shrubs. It exercised PBR and shadows but did not read as a forest because there was no living tree canopy.
+
+## Decision
+
+- Add Poly Haven's [Pine Sapling Small](https://polyhaven.com/a/pine_sapling_small), modeling by Rico Cilliers and photography by Rob Tuytel, licensed CC0.
+- Keep the source 1K glTF/GLB-compatible model and relative JPEG PBR maps beside the model. Verify every downloaded file against the official API-reported MD5 and byte size and record it in `assets/reference_scene/polyhaven/DOWNLOADS.md`.
+- Use the three tree variants already instanced by the glTF as one grouped placement. Do not generate replacement tree geometry.
+- Limit this increment to one group placement at scale 3 while measuring the existing Release renderer. The source contains 398,144 triangles across three mesh instances; LOD, instancing, and frustum culling remain later work.
+
+## Consequences
+
+The Release reference scene now imports five models and renders seven placements. The model GPU cache reports 138,377,796 resident bytes, about 64.3 MB above the prior four-model scene. The 1280×720 validation screenshot is recorded at `artifacts/visual-verification/forest-pine-stage-2.png`.
+
+The 600-frame Release run averaged roughly 75 FPS on the NVIDIA GeForce GTX 1660 SUPER. The run also recorded keyboard input, so its high p95 values need a clean repeat before making a tail-latency claim. The pine canopy remains dark in the screenshot because this renderer has no environment image-based lighting and still uses a sparse technical layout; a complete forest scene is not claimed.

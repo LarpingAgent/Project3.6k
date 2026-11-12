@@ -124,7 +124,7 @@ void main() {
     vec3 emissive = texture(emissive_map, texture_uv).rgb * material.emissive_factor.rgb;
     vec3 hdr_color = direct + ambient + emissive;
     float camera_distance = length(scene.camera_position.xyz - world_position);
-    float fog = 1.0 - exp(-camera_distance * camera_distance * 0.0018);
+    float fog = 1.0 - exp(-camera_distance * camera_distance * 0.00055);
     hdr_color = mix(hdr_color, vec3(0.05, 0.08, 0.07), fog);
     out_color = vec4(max(hdr_color, vec3(0.0)), base.a);
 }

@@ -31,7 +31,13 @@ const SHADOW_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sh
 const SHADOW_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));
 const MATERIAL_TEXTURE_COUNT: usize = 5;
 const PUSH_CONSTANT_BYTES: u32 = 128;
-const MODEL_IDS: [&str; 4] = ["tree_stump_01", "rock_09", "dead_tree_trunk_02", "shrub_03"];
+const MODEL_IDS: [&str; 5] = [
+    "tree_stump_01",
+    "rock_09",
+    "dead_tree_trunk_02",
+    "shrub_03",
+    "pine_sapling_small",
+];
 const SUN_DIRECTION: Vec3 = Vec3::new(-0.43, 0.82, 0.38);
 const SUN_TARGET: Vec3 = Vec3::new(0.0, 0.5, -2.5);
 
@@ -209,7 +215,7 @@ impl ForestScene {
             ],
             sun_direction: [sun_direction.x, sun_direction.y, sun_direction.z, 1.0],
             sun_color: [3.2, 2.9, 2.55, 1.0],
-            ambient_color: [0.10, 0.12, 0.15, 1.0],
+            ambient_color: [0.18, 0.22, 0.17, 1.0],
         };
         self.camera_buffers[frame_index].upload(struct_bytes(&uniform))
     }
@@ -559,6 +565,9 @@ impl ForestScene {
         let shrub = *handles
             .get("shrub_03")
             .ok_or(VulkanRendererError::InvalidGpuAssetMaterial)?;
+        let pine = *handles
+            .get("pine_sapling_small")
+            .ok_or(VulkanRendererError::InvalidGpuAssetMaterial)?;
         self.models = vec![
             placed_model(
                 stump,
@@ -595,6 +604,12 @@ impl ForestScene {
                 Vec3::new(2.7, 0.008, -4.6),
                 Quat::from_rotation_y(1.2),
                 Vec3::splat(7.5),
+            ),
+            placed_model(
+                pine,
+                Vec3::new(0.6, 0.0, -8.0),
+                Quat::from_rotation_y(0.35),
+                Vec3::splat(3.0),
             ),
         ];
         Ok(())

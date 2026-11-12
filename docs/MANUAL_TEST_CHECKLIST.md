@@ -4,7 +4,7 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 
 ## Phase 4a CPU asset pipeline
 
-- `cargo test -p project3-6k-assets` verifies synthetic glTF/GLB fixtures and imports the four curated Poly Haven glTF models from `assets/reference_scene/polyhaven/`, including their external JPEG PBR maps.
+- `cargo test -p project3-6k-assets` verifies synthetic glTF/GLB fixtures and imports the five curated Poly Haven glTF models from `assets/reference_scene/polyhaven/`, including their external JPEG PBR maps.
 - `cargo test -p project3-6k-assets imports_curated_polyhaven_reference_models_from_disk -- --nocapture` prints the imported mesh, instance, material, image, and retained CPU-byte counts for those real files.
 - **NOT VERIFIED BY AUTOMATION** — Open a separately supplied glTF/GLB with embedded and relative PNG/JPEG resources; confirm validation errors identify unsupported content and malformed external paths cleanly.
 - **NOT VERIFIED BY AUTOMATION** — Confirm each added asset has a source, author, license, and attribution record in `assets/ASSET_SOURCES.md`.
@@ -13,6 +13,7 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 
 - `cargo run -p project3-6k-app -- --run-frames 5 --validation --capture-frame artifacts/visual-verification/baseline-before-rendering-upgrade.png` captures one real swapchain frame and exits only after five submitted frames. This baseline was captured and opened successfully; inspect it before comparing later builds.
 - **VERIFIED** — [release-shadow-reference.png](../artifacts/visual-verification/release-shadow-reference.png) was captured from the Release Vulkan build at 1280×720 and opened for inspection. It shows real ground/model textures and cast shadows after the shadow pass was added.
+- **VERIFIED** — [forest-pine-stage-2.png](../artifacts/visual-verification/forest-pine-stage-2.png) was captured from the updated Release build with validation enabled. It shows the newly imported three-pine cluster in front of the ground/model/shadow scene.
 
 ## Rendering and asset foundation
 
@@ -22,7 +23,7 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 - **VERIFIED** — [pbr-foundation-stage-3.png](../artifacts/visual-verification/pbr-foundation-stage-3.png) was captured from the running Vulkan application and opened at 1280×720. The floor, stump, rocks, upright trunk, foliage, PBR map response, and directional light are visible.
 - **VERIFIED** — [hdr-stage-1.png](../artifacts/visual-verification/hdr-stage-1.png) was captured from the native Vulkan application after rendering to an FP16 target and running the separate ACES tone-mapping pass. `--validation` completed with exit code 0.
 - **VERIFIED** — `--validation` completed with exit code 0 for the shadow capture. Shadow map is a single 1024² map with four comparison taps; aliasing and lack of cascades remain visible limitations.
-- **VERIFIED** — 600 submitted frames on NVIDIA GeForce GTX 1660 SUPER, 1280×720 Windows Release build: 74.3–78.5 FPS across five rolling batches, 12.7–13.5 ms average interval, 14.7–15.6 ms p95. No screenshot readback was enabled for this measurement.
+- **VERIFIED** — 600 submitted frames on NVIDIA GeForce GTX 1660 SUPER, 1280×720 Windows Release build with the pine cluster: 74.9–76.7 FPS and 13.0–13.35 ms average interval. Keyboard activity was recorded during that run and p95 ranged 38.4–39.7 ms; repeat without input for a clean tail-latency check. No screenshot readback was enabled for this measurement.
 - **VERIFIED** — A same-size resize notification no longer causes a second asset import/upload; the window system test reported one import cycle. Real size changes still rebuild the scene and may stall during synchronous loading.
 - **NOT VERIFIED BY AUTOMATION** — Check the technical scene on a second Vulkan GPU, inspect foliage alpha edges and texture tiling at multiple distances, and assess shadow aliasing/camera coverage by moving around the scene.
 
@@ -32,7 +33,7 @@ Items marked **NOT VERIFIED BY AUTOMATION** require an interactive check. Automa
 - **NOT VERIFIED BY AUTOMATION** — Close the window with its title-bar close button and confirm the same shutdown path completes.
 - **NOT VERIFIED BY AUTOMATION** — Resize the window repeatedly by dragging its edge and confirm it redraws at the new size without visible corruption. A real size change currently rebuilds the scene and reloads assets, so expect a startup-like hitch until persistent GPU assets are separated from swapchain resources.
 - **NOT VERIFIED BY AUTOMATION** — Minimize and restore the window; confirm drawing suspends while minimized and resumes after restore.
-- **VERIFIED** — Automated 600-frame run completed cleanly. The initial scene setup still blocks the window while its four CPU imports and GPU uploads complete (about 10.3 seconds on the recorded machine).
+- **VERIFIED** — Automated 600-frame Release run completed. Initial five-model scene setup took about 1.63 seconds on the recorded machine.
 
 ## Phase 3c first-person camera
 

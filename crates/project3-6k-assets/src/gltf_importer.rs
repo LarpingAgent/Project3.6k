@@ -1293,7 +1293,13 @@ mod tests {
     fn imports_curated_polyhaven_reference_models_from_disk() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets/reference_scene/polyhaven");
-        for asset in ["tree_stump_01", "rock_09", "dead_tree_trunk_02", "shrub_03"] {
+        for asset in [
+            "tree_stump_01",
+            "rock_09",
+            "dead_tree_trunk_02",
+            "shrub_03",
+            "pine_sapling_small",
+        ] {
             let path = root.join(asset).join(format!("{asset}-1k.gltf"));
             let model = import_gltf(&path, ModelImportLimits::default())
                 .unwrap_or_else(|error| panic!("failed to import {}: {error}", path.display()));

@@ -24,8 +24,16 @@ Downloaded from `https://api.polyhaven.com/files/{asset-id}` on 2026-11-12. Mode
 | `shrub_03/textures/shrub_03_arm_1k.jpg` | 396,238 | `67faf4c5c213589b41a3bd18d378fa7d` |
 | `shrub_03/textures/shrub_03_diff_1k.jpg` | 481,841 | `5da9190b7c2837a9e209a3fe774dba3c` |
 | `shrub_03/textures/shrub_03_nor_gl_1k.jpg` | 504,734 | `38956b2171644cfefda2ef542e055100` |
+| `pine_sapling_small/pine_sapling_small-1k.gltf` | 11,442 | `237a7672645631550ae571743aa9f55b` |
+| `pine_sapling_small/pine_sapling_small.bin` | 17,771,796 | `76dd1802d8de128c812f2e124a258b35` |
+| `pine_sapling_small/textures/pine_sapling_small_twig_arm_1k.jpg` | 394,056 | `b5062030fc42ec7bd12eb3f052054104` |
+| `pine_sapling_small/textures/pine_sapling_small_twig_diff_1k.jpg` | 477,942 | `dacc918bb421968e9ccc1956d78a2dbe` |
+| `pine_sapling_small/textures/pine_sapling_small_bark_nor_gl_1k.jpg` | 1,016,849 | `bb6e3a6eea777d992cef48fabfdc538c` |
+| `pine_sapling_small/textures/pine_sapling_small_bark_diff_1k.jpg` | 725,265 | `7d3a558ed614c7e75594c7be3bf80311` |
+| `pine_sapling_small/textures/pine_sapling_small_bark_arm_1k.jpg` | 801,278 | `21d1abd15e40951825a4f3da110b20ea` |
+| `pine_sapling_small/textures/pine_sapling_small_twig_nor_gl_1k.jpg` | 692,711 | `eebc5a81f8f6231d8e18ec4ad7292798` |
 | `forrest_ground_03/forrest_ground_03_diff_1k.jpg` | 821,191 | `0a63f012ae0e3663451b5a0e5049975a` |
 | `forrest_ground_03/forrest_ground_03_nor_gl_1k.jpg` | 1,587,102 | `9f44096b43a0f796ae6f52d7fe784698` |
 | `forrest_ground_03/forrest_ground_03_arm_1k.jpg` | 272,025 | `6f166341687a85219ad54e22aabd2547` |
 
-The four glTF model files imported successfully in `project3-6k-assets` tests. The 1K material maps are intentionally retained beside their source glTF files so relative URIs remain self-contained.
+All five glTF model files imported successfully in `project3-6k-assets` tests. The 1K material maps are intentionally retained beside their source glTF files so relative URIs remain self-contained.
