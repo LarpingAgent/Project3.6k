@@ -19,7 +19,8 @@ layout(set = 0, binding = 0) uniform SceneUniform {
     vec4 irradiance_sh[9];
 } scene;
 layout(set = 0, binding = 1) uniform sampler2DShadow directional_shadow_map;
-layout(set = 0, binding = 2) uniform sampler2D environment_map;
+layout(set = 0, binding = 3) uniform sampler2D prefiltered_environment;
+layout(set = 0, binding = 4) uniform sampler2D environment_brdf_lut;
 
 layout(set = 1, binding = 0) uniform sampler2D base_color_map;
 layout(set = 1, binding = 1) uniform sampler2D normal_map;
@@ -58,10 +59,6 @@ vec2 environment_uv(vec3 direction) {
     vec3 d = normalize(direction);
     return vec2(atan(d.z, d.x) / (2.0 * PI) + 0.5,
         acos(clamp(d.y, -1.0, 1.0)) / PI);
-}
-
-vec3 sample_environment(vec3 direction, float mip_level) {
-    return textureLod(environment_map, environment_uv(direction), mip_level).rgb;
 }
 
 vec3 evaluate_diffuse_irradiance(vec3 normal) {
@@ -155,17 +152,23 @@ void main() {
     float n_dot_v = max(dot(normal, view), 0.001);
     vec3 f0 = mix(vec3(0.04), base.rgb, metallic);
     vec3 environment_fresnel = fresnel_schlick(n_dot_v, f0);
-    float max_environment_mip = float(textureQueryLevels(environment_map) - 1);
     vec3 diffuse_irradiance = evaluate_diffuse_irradiance(normal) * 0.55;
     if (material.material_flags.y > 0.5) {
         diffuse_irradiance += evaluate_diffuse_irradiance(-normal) * 0.35;
     }
     vec3 reflected = reflect(-view, normal);
-    vec3 specular_radiance = sample_environment(reflected, roughness * max_environment_mip) * 0.04;
+    float max_specular_mip = float(textureQueryLevels(prefiltered_environment) - 1);
+    vec3 prefiltered_radiance = textureLod(
+        prefiltered_environment,
+        environment_uv(reflected),
+        roughness * max_specular_mip
+    ).rgb;
+    vec2 brdf = texture(environment_brdf_lut, vec2(n_dot_v, roughness)).rg;
+    vec3 specular_ibl = prefiltered_radiance * (f0 * brdf.x + brdf.y);
     vec3 diffuse_weight = (vec3(1.0) - environment_fresnel) * (1.0 - metallic);
     float indirect_ao = mix(0.55, 1.0, ao);
     vec3 ambient = (diffuse_weight * base.rgb * diffuse_irradiance
-        + environment_fresnel * specular_radiance) * indirect_ao;
+        + specular_ibl) * indirect_ao;
     ambient += scene.ambient_color.rgb * base.rgb * ao * 0.15;
     vec3 emissive = texture(emissive_map, texture_uv).rgb * material.emissive_factor.rgb;
     vec3 hdr_color = direct + ambient + emissive;

@@ -21,7 +21,7 @@ use super::{
         GpuAssetCache, GpuDrawRange, GpuMaterial, GpuModelAsset, GpuModelHandle, GpuVertex,
         upload_gpu_mesh,
     },
-    gpu_resources::{BufferAllocation, TextureResource},
+    gpu_resources::{BufferAllocation, EnvironmentTextureUpload, TextureResource},
     shadow_target::{SHADOW_MAP_EXTENT, ShadowTarget},
 };
 
@@ -82,6 +82,8 @@ struct GroundResources {
 
 struct EnvironmentResources {
     texture: TextureResource,
+    specular_texture: TextureResource,
+    brdf_lut_texture: TextureResource,
     gpu_bytes: usize,
     irradiance_sh: [[f32; 4]; 9],
 }
@@ -118,6 +120,8 @@ pub(super) struct ForestScene {
     camera_buffers: Vec<BufferAllocation>,
     ground: Option<GroundResources>,
     environment: Option<TextureResource>,
+    specular_environment: Option<TextureResource>,
+    brdf_lut: Option<TextureResource>,
     irradiance_sh: [[f32; 4]; 9],
     fallbacks: Option<FallbackTextures>,
     gpu_assets: GpuAssetCache,
@@ -163,6 +167,8 @@ impl ForestScene {
             camera_buffers: Vec::new(),
             ground: None,
             environment: None,
+            specular_environment: None,
+            brdf_lut: None,
             irradiance_sh: [[0.0; 4]; 9],
             fallbacks: None,
             gpu_assets,
@@ -187,6 +193,8 @@ impl ForestScene {
         let environment_bytes = environment.gpu_bytes;
         scene.irradiance_sh = environment.irradiance_sh;
         scene.environment = Some(environment.texture);
+        scene.specular_environment = Some(environment.specular_texture);
+        scene.brdf_lut = Some(environment.brdf_lut_texture);
         scene.fallbacks = Some(FallbackTextures::new(
             device,
             memory_properties,
@@ -455,8 +463,18 @@ impl ForestScene {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
-        // SAFETY: The scene set contains its per-frame uniform, shadow map, and environment map.
+        // SAFETY: The scene set contains its uniform, shadow, sky, prefiltered radiance, and BRDF LUT.
         self.descriptor_set_layout = unsafe {
             self.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&scene_bindings),
@@ -837,7 +855,7 @@ impl ForestScene {
         let material_descriptor_count = material_set_count
             .checked_mul(MATERIAL_TEXTURE_COUNT)
             .and_then(|count| count.checked_add(shadow_targets.len()))
-            .and_then(|count| count.checked_add(FRAMES_IN_FLIGHT))
+            .and_then(|count| count.checked_add(FRAMES_IN_FLIGHT.checked_mul(3)?))
             .and_then(|count| u32::try_from(count).ok())
             .ok_or(VulkanRendererError::GpuAssetSizeOverflow)?;
         let pool_sizes = [
@@ -854,7 +872,7 @@ impl ForestScene {
             .checked_add(material_set_count)
             .and_then(|count| u32::try_from(count).ok())
             .ok_or(VulkanRendererError::GpuAssetSizeOverflow)?;
-        // SAFETY: Pool sizes cover scene uniforms, shadow/environment maps, and five maps per material.
+        // SAFETY: Pool sizes cover scene uniforms, four scene images, and five maps per material.
         self.descriptor_pool = unsafe {
             self.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -891,6 +909,24 @@ impl ForestScene {
                 .sampler(environment.sampler)
                 .image_view(environment.view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let specular_info = [vk::DescriptorImageInfo::default()
+                .sampler(
+                    self.specular_environment
+                        .as_ref()
+                        .expect("GGX environment is loaded")
+                        .sampler,
+                )
+                .image_view(
+                    self.specular_environment
+                        .as_ref()
+                        .expect("GGX environment is loaded")
+                        .view,
+                )
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let brdf_lut_info = [vk::DescriptorImageInfo::default()
+                .sampler(self.brdf_lut.as_ref().expect("BRDF LUT is loaded").sampler)
+                .image_view(self.brdf_lut.as_ref().expect("BRDF LUT is loaded").view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(*descriptor_set)
@@ -907,8 +943,18 @@ impl ForestScene {
                     .dst_binding(2)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&environment_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*descriptor_set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&specular_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*descriptor_set)
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&brdf_lut_info),
             ];
-            // SAFETY: The set references its frame uniform, fence-safe shadow, and owned environment.
+            // SAFETY: The set references its frame data, fence-safe shadow, and scene-owned lighting maps.
             unsafe { self.device.update_descriptor_sets(&writes, &[]) };
         }
 
@@ -1363,10 +1409,45 @@ fn load_environment(
         hdr_format,
         &decoded,
     )?;
+    let specular_base = decoded
+        .specular_mip_levels
+        .first()
+        .ok_or(VulkanRendererError::InvalidGpuAssetTexture)?;
+    let specular_texture = TextureResource::new_environment_levels(
+        device,
+        memory_properties,
+        queue,
+        queue_family_index,
+        hdr_format,
+        EnvironmentTextureUpload {
+            width: specular_base.width,
+            height: specular_base.height,
+            levels: &decoded.specular_mip_levels,
+            address_mode_u: vk::SamplerAddressMode::REPEAT,
+            address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        },
+    )?;
+    let brdf_lut_texture = TextureResource::new_environment_levels(
+        device,
+        memory_properties,
+        queue,
+        queue_family_index,
+        hdr_format,
+        EnvironmentTextureUpload {
+            width: decoded.brdf_lut.width,
+            height: decoded.brdf_lut.height,
+            levels: std::slice::from_ref(&decoded.brdf_lut),
+            address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        },
+    )?;
     info!(
         width = decoded.width,
         height = decoded.height,
-        mip_levels = decoded.mip_levels.len(),
+        sky_mip_levels = decoded.mip_levels.len(),
+        specular_mip_levels = decoded.specular_mip_levels.len(),
+        brdf_lut_width = decoded.brdf_lut.width,
+        brdf_lut_height = decoded.brdf_lut.height,
         cpu_bytes = decoded.byte_size(),
         gpu_bytes,
         import_upload_ms = started.elapsed().as_secs_f64() * 1000.0,
@@ -1374,6 +1455,8 @@ fn load_environment(
     );
     Ok(EnvironmentResources {
         texture,
+        specular_texture,
+        brdf_lut_texture,
         gpu_bytes,
         irradiance_sh,
     })

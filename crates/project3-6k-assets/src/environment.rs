@@ -11,6 +11,13 @@ use thiserror::Error;
 
 use crate::ModelImportLimits;
 
+const SPECULAR_BASE_WIDTH: u32 = 256;
+const SPECULAR_BASE_HEIGHT: u32 = 128;
+const SPECULAR_SAMPLE_COUNT: u32 = 64;
+const BRDF_LUT_WIDTH: u32 = 128;
+const BRDF_LUT_HEIGHT: u32 = 128;
+const BRDF_SAMPLE_COUNT: u32 = 128;
+
 /// One linear-light RGBA32F level of an equirectangular environment texture.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EnvironmentMipLevel {
@@ -31,14 +38,18 @@ pub struct CpuEnvironmentMap {
     pub height: u32,
     /// Base level followed by linearly averaged levels down to 1x1.
     pub mip_levels: Vec<EnvironmentMipLevel>,
+    /// GGX-prefiltered specular radiance, with mip level encoding roughness.
+    pub specular_mip_levels: Vec<EnvironmentMipLevel>,
+    /// Split-sum BRDF integration; red is the scale term and green is the bias term.
+    pub brdf_lut: EnvironmentMipLevel,
     /// Lambertian diffuse irradiance in real spherical harmonics, normalized by PI.
     pub irradiance_sh: [[f32; 4]; 9],
-    /// Retained CPU bytes across all mip levels.
+    /// Retained CPU bytes across the sky, specular, and BRDF lookup data.
     byte_size: usize,
 }
 
 impl CpuEnvironmentMap {
-    /// Returns retained CPU bytes across all mip levels.
+    /// Returns retained CPU bytes across all environment rendering data.
     pub fn byte_size(&self) -> usize {
         self.byte_size
     }
@@ -198,13 +209,303 @@ pub fn import_environment_hdr(
         });
     }
 
+    let specular_base = mip_levels
+        .iter()
+        .find(|level| level.width <= SPECULAR_BASE_WIDTH && level.height <= SPECULAR_BASE_HEIGHT)
+        .or_else(|| mip_levels.last())
+        .expect("environment mip chain contains a base level");
+    let specular_base_bytes = specular_base
+        .rgba32f
+        .len()
+        .checked_mul(size_of::<[f32; 4]>())
+        .ok_or(EnvironmentImportError::SizeOverflow)?;
+    let mut retained_bytes = total_bytes
+        .checked_add(specular_base_bytes)
+        .ok_or(EnvironmentImportError::SizeOverflow)?;
+    check_limit(
+        "environment lighting bytes",
+        retained_bytes
+            .checked_add(decoded_bytes)
+            .ok_or(EnvironmentImportError::SizeOverflow)?,
+        limits.max_total_cpu_bytes,
+    )?;
+    let mut specular_mip_levels = vec![specular_base.clone()];
+    while specular_mip_levels
+        .last()
+        .is_some_and(|level| level.width > 1 || level.height > 1)
+    {
+        let source = specular_mip_levels
+            .last()
+            .expect("specular base mip exists");
+        let width = (source.width / 2).max(1);
+        let height = (source.height / 2).max(1);
+        let pixel_count = checked_pixel_count(width, height)?;
+        let level_bytes = pixel_count
+            .checked_mul(size_of::<[f32; 4]>())
+            .ok_or(EnvironmentImportError::SizeOverflow)?;
+        retained_bytes = retained_bytes
+            .checked_add(level_bytes)
+            .ok_or(EnvironmentImportError::SizeOverflow)?;
+        check_limit(
+            "environment lighting bytes",
+            retained_bytes
+                .checked_add(decoded_bytes)
+                .ok_or(EnvironmentImportError::SizeOverflow)?,
+            limits.max_total_cpu_bytes,
+        )?;
+        let roughness = specular_mip_levels.len() as f32
+            / ((specular_base.width.max(specular_base.height).ilog2()) as f32);
+        let pixels = prefilter_specular_level(
+            &mip_levels,
+            width,
+            height,
+            roughness.clamp(0.0, 1.0),
+            SPECULAR_SAMPLE_COUNT,
+        );
+        specular_mip_levels.push(EnvironmentMipLevel {
+            width,
+            height,
+            rgba32f: pixels,
+        });
+    }
+    let brdf_pixel_count = checked_pixel_count(BRDF_LUT_WIDTH, BRDF_LUT_HEIGHT)?;
+    let brdf_bytes = brdf_pixel_count
+        .checked_mul(size_of::<[f32; 4]>())
+        .ok_or(EnvironmentImportError::SizeOverflow)?;
+    retained_bytes = retained_bytes
+        .checked_add(brdf_bytes)
+        .ok_or(EnvironmentImportError::SizeOverflow)?;
+    check_limit(
+        "environment lighting bytes",
+        retained_bytes
+            .checked_add(decoded_bytes)
+            .ok_or(EnvironmentImportError::SizeOverflow)?,
+        limits.max_total_cpu_bytes,
+    )?;
+    let brdf_lut = integrate_brdf_lut(BRDF_LUT_WIDTH, BRDF_LUT_HEIGHT, BRDF_SAMPLE_COUNT);
+
     Ok(CpuEnvironmentMap {
         width,
         height,
         mip_levels,
+        specular_mip_levels,
+        brdf_lut,
         irradiance_sh,
-        byte_size: total_bytes,
+        byte_size: retained_bytes,
     })
+}
+
+fn prefilter_specular_level(
+    environment_mips: &[EnvironmentMipLevel],
+    width: u32,
+    height: u32,
+    roughness: f32,
+    sample_count: u32,
+) -> Vec<[f32; 4]> {
+    let samples = hammersley_samples(sample_count);
+    let alpha = roughness.max(0.001).powi(2);
+    let alpha_squared = alpha * alpha;
+    let source_texel_solid_angle = 4.0 * std::f32::consts::PI
+        / (environment_mips[0].width * environment_mips[0].height) as f32;
+    let mut pixels = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        let theta = std::f32::consts::PI * (y as f32 + 0.5) / height as f32;
+        for x in 0..width {
+            let phi = std::f32::consts::TAU * ((x as f32 + 0.5) / width as f32 - 0.5);
+            let normal = [
+                theta.sin() * phi.cos(),
+                theta.cos(),
+                theta.sin() * phi.sin(),
+            ];
+            let up = if normal[1].abs() < 0.999 {
+                [0.0, 1.0, 0.0]
+            } else {
+                [1.0, 0.0, 0.0]
+            };
+            let tangent = normalize3(cross3(up, normal));
+            let bitangent = cross3(normal, tangent);
+            let mut sum = [0.0; 3];
+            let mut weight_sum = 0.0;
+            for sample in &samples {
+                let sample_phi = std::f32::consts::TAU * sample[0];
+                let cos_theta =
+                    ((1.0 - sample[1]) / (1.0 + (alpha_squared - 1.0) * sample[1])).sqrt();
+                let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+                let half_tangent = [
+                    sin_theta * sample_phi.cos(),
+                    sin_theta * sample_phi.sin(),
+                    cos_theta,
+                ];
+                let half_vector = normalize3(add3(
+                    add3(
+                        scale3(tangent, half_tangent[0]),
+                        scale3(bitangent, half_tangent[1]),
+                    ),
+                    scale3(normal, half_tangent[2]),
+                ));
+                let n_dot_h = dot3(normal, half_vector).max(0.0);
+                let view_dot_h = n_dot_h;
+                let light = normalize3(sub3(scale3(half_vector, 2.0 * view_dot_h), normal));
+                let n_dot_l = dot3(normal, light).max(0.0);
+                if n_dot_l <= 0.0 || view_dot_h <= 0.000001 {
+                    continue;
+                }
+                let denominator = n_dot_h * n_dot_h * (alpha_squared - 1.0) + 1.0;
+                let distribution = alpha_squared
+                    / (std::f32::consts::PI * denominator * denominator).max(0.000001);
+                let pdf = (distribution * n_dot_h / (4.0 * view_dot_h)).max(0.000001);
+                let sample_solid_angle = 1.0 / (sample_count as f32 * pdf);
+                let source_lod = (0.5 * (sample_solid_angle / source_texel_solid_angle).log2())
+                    .clamp(0.0, (environment_mips.len() - 1) as f32);
+                let radiance = sample_environment_lod(environment_mips, light, source_lod);
+                for channel in 0..3 {
+                    sum[channel] += radiance[channel] * n_dot_l;
+                }
+                weight_sum += n_dot_l;
+            }
+            let inverse_weight = 1.0 / weight_sum.max(0.000001);
+            pixels.push([
+                sum[0] * inverse_weight,
+                sum[1] * inverse_weight,
+                sum[2] * inverse_weight,
+                1.0,
+            ]);
+        }
+    }
+    pixels
+}
+
+fn integrate_brdf_lut(width: u32, height: u32, sample_count: u32) -> EnvironmentMipLevel {
+    let samples = hammersley_samples(sample_count);
+    let mut pixels = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        let roughness = (y as f32 + 0.5) / height as f32;
+        let alpha = roughness * roughness;
+        let alpha_squared = alpha * alpha;
+        let k = roughness * roughness * 0.5;
+        for x in 0..width {
+            let n_dot_v = (x as f32 + 0.5) / width as f32;
+            let view = [(1.0 - n_dot_v * n_dot_v).sqrt(), 0.0, n_dot_v];
+            let mut scale = 0.0;
+            let mut bias = 0.0;
+            for sample in &samples {
+                let phi = std::f32::consts::TAU * sample[0];
+                let cos_theta =
+                    ((1.0 - sample[1]) / (1.0 + (alpha_squared - 1.0) * sample[1])).sqrt();
+                let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+                let half_vector = [sin_theta * phi.cos(), sin_theta * phi.sin(), cos_theta];
+                let view_dot_h = dot3(view, half_vector).max(0.0);
+                let light = normalize3(sub3(scale3(half_vector, 2.0 * view_dot_h), view));
+                let n_dot_l = light[2].max(0.0);
+                let n_dot_h = half_vector[2].max(0.0);
+                if n_dot_l <= 0.0 || n_dot_h <= 0.0 || view_dot_h <= 0.0 {
+                    continue;
+                }
+                let geometry_view = n_dot_v / (n_dot_v * (1.0 - k) + k).max(0.000001);
+                let geometry_light = n_dot_l / (n_dot_l * (1.0 - k) + k).max(0.000001);
+                let visibility =
+                    geometry_view * geometry_light * view_dot_h / (n_dot_h * n_dot_v).max(0.000001);
+                let fresnel = (1.0 - view_dot_h).clamp(0.0, 1.0).powi(5);
+                scale += (1.0 - fresnel) * visibility;
+                bias += fresnel * visibility;
+            }
+            pixels.push([
+                scale / sample_count as f32,
+                bias / sample_count as f32,
+                0.0,
+                1.0,
+            ]);
+        }
+    }
+    EnvironmentMipLevel {
+        width,
+        height,
+        rgba32f: pixels,
+    }
+}
+
+fn hammersley_samples(sample_count: u32) -> Vec<[f32; 2]> {
+    (0..sample_count)
+        .map(|index| {
+            [
+                index as f32 / sample_count as f32,
+                index.reverse_bits() as f32 * 2.328_306_4e-10,
+            ]
+        })
+        .collect()
+}
+
+fn sample_environment_lod(
+    levels: &[EnvironmentMipLevel],
+    direction: [f32; 3],
+    lod: f32,
+) -> [f32; 3] {
+    let low = lod.floor() as usize;
+    let high = (low + 1).min(levels.len() - 1);
+    let blend = lod.fract();
+    let a = sample_environment(&levels[low], direction);
+    let b = sample_environment(&levels[high], direction);
+    std::array::from_fn(|channel| a[channel] + (b[channel] - a[channel]) * blend)
+}
+
+fn sample_environment(level: &EnvironmentMipLevel, direction: [f32; 3]) -> [f32; 3] {
+    let direction = normalize3(direction);
+    let u = direction[2].atan2(direction[0]) / std::f32::consts::TAU + 0.5;
+    let v = direction[1].clamp(-1.0, 1.0).acos() / std::f32::consts::PI;
+    let x = u * level.width as f32 - 0.5;
+    let y = v * level.height as f32 - 0.5;
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let tx = x - x.floor();
+    let ty = y - y.floor();
+    let x_indices = [
+        x0.rem_euclid(level.width as i32),
+        (x0 + 1).rem_euclid(level.width as i32),
+    ];
+    let y_indices = [
+        y0.clamp(0, level.height as i32 - 1),
+        (y0 + 1).clamp(0, level.height as i32 - 1),
+    ];
+    let taps = [
+        level.rgba32f[(y_indices[0] * level.width as i32 + x_indices[0]) as usize],
+        level.rgba32f[(y_indices[0] * level.width as i32 + x_indices[1]) as usize],
+        level.rgba32f[(y_indices[1] * level.width as i32 + x_indices[0]) as usize],
+        level.rgba32f[(y_indices[1] * level.width as i32 + x_indices[1]) as usize],
+    ];
+    std::array::from_fn(|channel| {
+        let top = taps[0][channel] + (taps[1][channel] - taps[0][channel]) * tx;
+        let bottom = taps[2][channel] + (taps[3][channel] - taps[2][channel]) * tx;
+        top + (bottom - top) * ty
+    })
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn scale3(vector: [f32; 3], scale: f32) -> [f32; 3] {
+    [vector[0] * scale, vector[1] * scale, vector[2] * scale]
+}
+
+fn normalize3(vector: [f32; 3]) -> [f32; 3] {
+    let inverse_length = dot3(vector, vector).max(0.000001).sqrt().recip();
+    scale3(vector, inverse_length)
 }
 
 #[derive(Debug, Error)]
@@ -362,13 +663,40 @@ mod tests {
                 .flat_map(|level| &level.rgba32f)
                 .any(|pixel| pixel[0] > 1.0 || pixel[1] > 1.0 || pixel[2] > 1.0)
         );
+        let retained_bytes = environment
+            .mip_levels
+            .iter()
+            .chain(&environment.specular_mip_levels)
+            .map(|level| level.rgba32f.len() * 16)
+            .sum::<usize>()
+            + environment.brdf_lut.rgba32f.len() * 16;
+        assert_eq!(environment.byte_size(), retained_bytes);
         assert_eq!(
-            environment.byte_size(),
             environment
-                .mip_levels
+                .specular_mip_levels
+                .first()
+                .map(|level| (level.width, level.height)),
+            Some((256, 128))
+        );
+        assert_eq!(
+            environment
+                .specular_mip_levels
+                .last()
+                .map(|level| (level.width, level.height)),
+            Some((1, 1))
+        );
+        assert_eq!(
+            (environment.brdf_lut.width, environment.brdf_lut.height),
+            (128, 128)
+        );
+        assert!(
+            environment
+                .specular_mip_levels
                 .iter()
-                .map(|level| level.rgba32f.len() * 16)
-                .sum::<usize>()
+                .flat_map(|level| &level.rgba32f)
+                .chain(&environment.brdf_lut.rgba32f)
+                .flatten()
+                .all(|value| value.is_finite())
         );
     }
 
@@ -401,5 +729,32 @@ mod tests {
                 .flatten()
                 .all(|coefficient| coefficient.abs() < 0.002)
         );
+    }
+
+    #[test]
+    fn ggx_prefilter_preserves_a_constant_environment() {
+        let pixels = vec![[0.75, 0.5, 0.25, 1.0]; 32 * 16];
+        let environment = [EnvironmentMipLevel {
+            width: 32,
+            height: 16,
+            rgba32f: pixels,
+        }];
+        let filtered = prefilter_specular_level(&environment, 8, 4, 0.6, 32);
+        assert!(filtered.iter().all(|pixel| {
+            (pixel[0] - 0.75).abs() < 0.0001
+                && (pixel[1] - 0.5).abs() < 0.0001
+                && (pixel[2] - 0.25).abs() < 0.0001
+        }));
+    }
+
+    #[test]
+    fn brdf_lut_contains_finite_bounded_split_sum_terms() {
+        let lut = integrate_brdf_lut(16, 16, 64);
+        assert!(lut.rgba32f.iter().all(|pixel| {
+            pixel[0].is_finite()
+                && pixel[1].is_finite()
+                && (0.0..=1.0).contains(&pixel[0])
+                && (0.0..=1.0).contains(&pixel[1])
+        }));
     }
 }

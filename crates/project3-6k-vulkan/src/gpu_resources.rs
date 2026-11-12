@@ -4,7 +4,7 @@ use std::ptr;
 
 use ash::vk;
 use half::f16;
-use project3_6k_assets::{CpuEnvironmentMap, TextureAsset};
+use project3_6k_assets::{CpuEnvironmentMap, EnvironmentMipLevel, TextureAsset};
 
 use super::{Result, VulkanRendererError};
 
@@ -189,6 +189,14 @@ struct TextureUploadConfig {
     address_mode_v: vk::SamplerAddressMode,
 }
 
+pub(super) struct EnvironmentTextureUpload<'a> {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) levels: &'a [EnvironmentMipLevel],
+    pub(super) address_mode_u: vk::SamplerAddressMode,
+    pub(super) address_mode_v: vk::SamplerAddressMode,
+}
+
 impl TextureResource {
     pub(super) fn new(
         device: &ash::Device,
@@ -232,24 +240,42 @@ impl TextureResource {
         format: vk::Format,
         decoded: &CpuEnvironmentMap,
     ) -> Result<Self> {
-        let packed_mips = decoded
-            .mip_levels
+        Self::new_environment_levels(
+            device,
+            memory_properties,
+            queue,
+            queue_family_index,
+            format,
+            EnvironmentTextureUpload {
+                width: decoded.width,
+                height: decoded.height,
+                levels: &decoded.mip_levels,
+                address_mode_u: vk::SamplerAddressMode::REPEAT,
+                address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            },
+        )
+    }
+
+    pub(super) fn new_environment_levels(
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        queue: vk::Queue,
+        queue_family_index: u32,
+        format: vk::Format,
+        upload: EnvironmentTextureUpload<'_>,
+    ) -> Result<Self> {
+        let EnvironmentTextureUpload {
+            width,
+            height,
+            levels: decoded_levels,
+            address_mode_u,
+            address_mode_v,
+        } = upload;
+        let packed_mips = decoded_levels
             .iter()
-            .map(|level| {
-                let mut bytes = Vec::with_capacity(level.rgba32f.len() * 8);
-                for pixel in &level.rgba32f {
-                    for channel in pixel {
-                        let finite_half_range = channel.clamp(0.0, f16::MAX.to_f32());
-                        bytes.extend_from_slice(
-                            &f16::from_f32(finite_half_range).to_bits().to_le_bytes(),
-                        );
-                    }
-                }
-                bytes
-            })
+            .map(pack_environment_level)
             .collect::<Vec<_>>();
-        let mips = decoded
-            .mip_levels
+        let mips = decoded_levels
             .iter()
             .zip(&packed_mips)
             .map(|(level, bytes)| TextureMipUpload {
@@ -266,11 +292,11 @@ impl TextureResource {
             &mips,
             TextureUploadConfig {
                 format,
-                width: decoded.width,
-                height: decoded.height,
+                width,
+                height,
                 bytes_per_pixel: 8,
-                address_mode_u: vk::SamplerAddressMode::REPEAT,
-                address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                address_mode_u,
+                address_mode_v,
             },
         )
     }
@@ -526,6 +552,17 @@ struct TextureMipUpload<'a> {
     width: u32,
     height: u32,
     bytes: &'a [u8],
+}
+
+fn pack_environment_level(level: &EnvironmentMipLevel) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(level.rgba32f.len() * 8);
+    for pixel in &level.rgba32f {
+        for channel in pixel {
+            let finite_half_range = channel.clamp(0.0, f16::MAX.to_f32());
+            bytes.extend_from_slice(&f16::from_f32(finite_half_range).to_bits().to_le_bytes());
+        }
+    }
+    bytes
 }
 
 impl Drop for TextureResource {
