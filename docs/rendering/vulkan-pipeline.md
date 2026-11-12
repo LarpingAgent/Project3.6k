@@ -1,5 +1,7 @@
 # Vulkan rendering and asset pipeline
 
+This is the implementation-level renderer reference. For current-versus-target engine boundaries, see [Phase 0 — Foundation Audit](../architecture/foundation-audit.md) and [Master Engine Architecture](../architecture/master-architecture.md).
+
 ## Current initialization
 
 1. Dynamically load Vulkan through `ash`, create the native surface, and select a graphics/present queue.

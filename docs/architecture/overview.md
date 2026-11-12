@@ -1,29 +1,39 @@
-# Architecture overview
+# Current architecture overview
 
-Project3.6k starts with the smallest set of modules that perform real work. It is a Cargo workspace, not a collection of placeholder crates.
+This document describes the committed implementation, not the target architecture. The evidence-based audit is [Phase 0 — Foundation Audit](foundation-audit.md); the full phase-based target is [Master Engine Architecture](master-architecture.md).
+
+## Current crate graph
 
 ```mermaid
 flowchart LR
-  app[app] --> platform[platform]
-  platform --> core[core]
-  platform --> vulkan[vulkan]
-  platform --> window[winit window]
-  vulkan --> assets[assets]
-  vulkan --> driver[Vulkan loader and driver]
+  app[project3-6k-app] --> platform[project3-6k-platform]
+  platform --> core[project3-6k-core]
+  platform --> vulkan[project3-6k-vulkan]
+  vulkan --> core
+  vulkan --> assets[project3-6k-assets]
+  vulkan --> driver[ash / Vulkan loader / GPU]
 ```
 
-## Ownership boundaries
+The workspace contains five crates. The dependency graph is detailed in [module-dependencies.md](module-dependencies.md).
 
-The platform crate owns the native `Window`, `VulkanRenderer`, and first-person camera state. The core crate owns the platform-neutral frame profiler, camera math, scene nodes, mesh handles, and transforms. The assets crate loads bounded CPU texture data, imports static glTF/GLB meshes and metallic-roughness materials, caches imported CPU models, and offers a bounded background loading queue without depending on Vulkan. The Vulkan crate uploads data and owns GPU resource lifetime, the instance, surface, device, swapchain, color/depth attachments, PBR graphics pipeline, bounded GPU model cache, sampled images and samplers, per-frame scene uniform buffers and material descriptor sets, framebuffers, command buffers, and synchronization primitives.
+## Current ownership boundaries
 
-The application explicitly drops the renderer before the native window because the Vulkan surface is tied to the window handles. The renderer waits for device idle before destroying swapchain resources, then the Vulkan context destroys the device, debug messenger, surface, and instance in dependency-safe order. The validation callback's state outlives the debug messenger and is checked after renderer shutdown.
+- `project3-6k-app` owns argument parsing and tracing initialization.
+- `project3-6k-platform` owns the `winit` event handler, native window, input, camera state, frame clock/profiler instances, and `VulkanRenderer`. It directly composes the current renderer.
+- `project3-6k-core` owns platform-neutral clock/profiler/camera math and a bounded `Scene` value container. That `Scene` is not wired to the live forest renderer.
+- `project3-6k-assets` owns CPU decoding/import, typed CPU model/material/texture/environment data, the CPU model/PNG caches, and a bounded CPU model worker. It has no Vulkan dependency.
+- `project3-6k-vulkan` owns the Vulkan context/device/surface, swapchain, frame synchronization, render targets/passes, static `ForestScene`, GPU model cache, sampled textures, and GPU resource lifetime.
 
-## Data flow
+The app drops the renderer before the window so the Vulkan surface is destroyed while the native window remains alive. The Vulkan renderer waits for device idle at swapchain teardown/recreation. Validation state remains alive through debug-messenger destruction.
 
-Native keyboard and raw mouse events update `InputState`; losing window focus clears held keys and releases cursor capture. The core `Camera` computes right-handed Vulkan view/projection matrices and bounded local movement without depending on the window or renderer. The platform layer sends its column-major matrix to Vulkan. Resize events mark the renderer suspended for zero-sized windows or request swapchain recreation when a valid extent changes. The deterministic `--resize-stress` mode exercises these transitions, including minimize/restore.
+## Current frame and asset flow
 
-The renderer currently owns the static technical reference scene, directional shadow pass, depth-tested PBR draws into per-image FP16 HDR targets, fullscreen ACES tone mapping, GPU synchronization, swapchain recreation, and submission. Ground and model data comes from licensed assets in the workspace and is loaded through the renderer-independent CPU importer; CPU objects do not contain Vulkan handles. Same-size resize notifications no longer cause a swapchain and scene rebuild. A real extent change still recreates scene resources and synchronously reloads assets, which is a known startup hitch to address when separating persistent asset resources from swapchain resources. The platform layer owns event dispatch, frame pacing, camera input, and deterministic resize stress. Debug builds enable validation; any warning or error makes the application return a failure after resources are dropped. Neither layer depends on gameplay systems.
+`winit` events update `InputState`; the platform application updates the camera and requests redraws at its configured frame interval. The renderer builds and draws its static forest reference scene into FP16 HDR, then tone maps to the swapchain. The CPU asset importer produces owned CPU data; model import uses a bounded worker, but startup drains all requested completions synchronously before GPU upload. GPU uploads and a real swapchain resize can block while the graphics queue/device is waited idle.
 
-## Planned growth
+The current `ForestScene` owns its asset handles, placements, material descriptor sets, PBR pipelines, environment textures, and render-facing uniforms. It does not receive entities or a render snapshot from `core::Scene` or an ECS.
 
-The assets crate provides bounded CPU decoding, model caching, and asynchronous import; Vulkan has a bounded GPU model/material cache and RAII resource ownership. The current scene uploads synchronously after asynchronous CPU import; runtime asset streaming remains future work. The renderer has directional GGX PBR, role-aware normal/material mipmaps, a single-map directional shadow path, distance fog, FP16 HDR, and ACES tone mapping. Cascaded shadows, environment image-based lighting, LOD, instancing, and terrain generation remain future work. Keep the technical scene static until it needs dynamic transform upload. Future world streaming must retain bounded budgets and use the existing async loading boundary rather than retaining the complete world in memory.
+## Implemented and deferred
+
+Implemented in the current renderer: external static glTF/GLB PBR assets, normal mapping, direct GGX PBR, SH diffuse IBL, GGX-prefiltered specular IBL with BRDF LUT, visible HDR environment, FP16 HDR, ACES tone mapping, a single 1024² directional shadow map, and optional PNG readback.
+
+Not implemented: engine orchestration independent from the platform crate, ECS/World, fixed simulation schedule, scene streaming, terrain, culling/instancing/LOD, cascaded shadows, asynchronous GPU uploads, physics, animation/audio, or gameplay. See the master architecture for phased boundaries and gates.

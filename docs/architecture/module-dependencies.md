@@ -1,30 +1,29 @@
-# Module dependencies
+# Current module dependencies
 
-## Current crates
+This table reflects Cargo manifests at the Phase 0 audit commit. It is distinct from the proposed target graph in [Master Engine Architecture](master-architecture.md).
 
-| Crate | Depends on | Public responsibility |
+| Crate | Direct dependencies | Actual responsibility |
 |---|---|---|
-| `project3-6k-assets` | `base64`, `glam`, `gltf`, `image`, `png`, `thiserror` | Bounded raster decoding, static glTF/GLB CPU import, PBR material data, generational CPU model/texture caches, and bounded asynchronous model loading |
-| `project3-6k-core` | `glam`, `thiserror` | `FrameClock`, rolling frame profiler, camera math, bounded scene nodes, and transforms |
-| `project3-6k-vulkan` | `ash`, `ash-window`, `glam`, core, assets, `png`, `raw-window-handle`, `winit`, `thiserror`, `tracing` | `VulkanRenderer` initialization, bounded GPU model/material cache, device-local mesh and PBR texture uploads, per-frame directional shadows, FP16 HDR targets, ACES presentation pass, PBR reference scene, capture/readback, resize, and draw API |
-| `project3-6k-platform` | core, Vulkan, `winit`, `thiserror`, `tracing` | `run()`, keyboard/mouse `InputState`, and window controls |
-| `project3-6k-app` | platform, `tracing`, `tracing-subscriber` | executable entry point |
+| `project3-6k-app` | `project3-6k-platform`, `tracing`, `tracing-subscriber` | Binary entry point, CLI parsing, logging setup |
+| `project3-6k-platform` | core, Vulkan, `winit`, `thiserror`, `tracing` | Native application/event loop, input, camera, timing, and direct renderer composition |
+| `project3-6k-core` | `glam`, `thiserror` | FrameClock, profiler, camera math, transform values, bounded Scene container |
+| `project3-6k-assets` | `base64`, `glam`, `gltf`, `image`, `png`, `thiserror` | Bounded CPU image/model/environment import, material data, CPU caches, async model loader |
+| `project3-6k-vulkan` | `ash`, `ash-window`, core, assets, `glam`, `half`, `png`, `raw-window-handle`, `thiserror`, `tracing`, `winit` | Vulkan context/swapchain/rendering, GPU asset cache, static reference scene, capture/readback |
 
 ```mermaid
 flowchart BT
+  app[project3-6k-app]
+  platform[project3-6k-platform]
   core[project3-6k-core]
   assets[project3-6k-assets]
   vulkan[project3-6k-vulkan]
-  platform[project3-6k-platform]
-  app[project3-6k-app]
   platform --> core
   platform --> vulkan
+  vulkan --> core
   vulkan --> assets
   app --> platform
 ```
 
-The platform crate coordinates core timing and Vulkan. Core does not know about windows, graphics, or application startup. Vulkan may consume CPU assets but the assets crate cannot import Vulkan or `ash`. This keeps file decoding separate from GPU resource management and prevents dependency cycles. `png` is used in Vulkan only for opt-in screenshot encoding; CPU image decoding remains in the assets crate.
+The dependency graph has no cycle. `project3-6k-assets` cannot see Vulkan types. `project3-6k-platform` currently depends on Vulkan directly; Phase 2 should decide the lifecycle/renderer contract before moving this edge. `project3-6k-core::Scene` is not currently the input to `project3-6k-vulkan::ForestScene`.
 
-## Crates intentionally deferred
-
-There are no empty crates for scene, world, physics, audio, or debug UI. Assets has concrete CPU texture/model import and bounded cache responsibilities. GPU upload and resource lifetime stay in Vulkan. Other crates should be added when their first concrete public interface is ready.
+Cargo tree evidence is captured in `docs/architecture/foundation-audit.md`. Future crates such as `engine`, `world`, and a backend-neutral render API are proposals only and must not be added as empty placeholders.

@@ -1,31 +1,35 @@
-# Memory and resource ownership
+# Current memory and resource ownership
 
-## Current CPU ownership
+This describes the implementation at the Phase 0 audit commit. Target ownership rules for ECS, a unified asset registry, and open-world streaming are in [Master Engine Architecture](../architecture/master-architecture.md).
 
-- `FrameClock` stores timestamps and an integer frame counter. `tick` performs no heap allocation.
-- `FrameProfiler` keeps 120 frame intervals and renderer-call durations in a fixed array. Recording and rolling-stat calculation allocate no heap memory.
-- `InputState` allocates only when the set of held keys changes; raw mouse deltas accumulate in a fixed two-value array.
-- The platform-owned `Camera` stores small vector/scalar state and performs no per-frame allocation.
-- Core `Scene` stores a bounded vector of mesh instances; each node carries a value-owned `Transform`. The current forest transforms are baked into GPU vertex data during initialization, so no per-frame scene allocation or dynamic upload occurs.
-- `AssetManager` owns decoded PNG mip chains under configurable per-image decode, resident-byte, key-size, and asset-count limits. `ModelAssetCache` owns imported CPU geometry and decoded images under count and byte budgets. Both caches use generation-tagged handles that become stale on unload; reusing a slot does not revive an older handle.
-- `AsyncModelLoader` owns one worker thread, a bounded request queue, and a bounded completion queue. It decodes only CPU-side model data. Queue back-pressure prevents uncollected completions from growing without limit; dropping the loader closes the result receiver and joins the worker after its current import finishes.
-- Vulkan object collections, per-swapchain-image depth attachments, and static forest vertex/index buffers are created during initialization or swapchain recreation, not during normal frame submission.
-- `ValidationState` uses atomics for counts and allocates message strings only when the Vulkan callback reports a warning or error.
-- The platform application owns the `Window` and `VulkanRenderer`; its `Drop` implementation takes the renderer first so the surface dies before the native window.
-- `--run-frames N` and `--auto-close` request exit through the normal event loop. The app's shutdown log is emitted only after the renderer (and its Vulkan RAII owners) and native window have been dropped.
+## CPU ownership
 
-## GPU ownership and destruction
+- `FrameClock` stores monotonic timestamps and a frame counter. `FrameProfiler` stores fixed-capacity samples; normal recording does not grow a vector.
+- `EngineApplication` owns `Window`, `VulkanRenderer`, `InputState`, `Camera`, clock, and profiler. It explicitly takes/drops the renderer before the window because the Vulkan surface depends on the native window handles.
+- Core `Scene` owns a bounded `Vec<SceneNode>` with value-owned mesh IDs and transforms. It is a prototype and is not the data source for the current Vulkan forest scene.
+- `AssetManager` owns decoded PNG texture mip chains under byte/count/key limits. `ModelAssetCache` owns imported CPU model payloads under byte/count budgets. Both use generation-checked handles. They are implemented and unit-tested but are not integrated into the current renderer's asset load path.
+- `AsyncModelLoader` owns one worker, bounded synchronous request/completion channels, request IDs, and the worker join handle. The worker owns temporary file/decode buffers and returns an owned `CpuModelAsset` or typed error. Dropping the loader closes channels and joins the worker.
+- Current app startup submits a fixed list of models and waits for all completions before upload. The environment importer and its GGX prefilter are synchronous. CPU cache residency is not persistent across swapchain recreation.
 
-The assets crate now also owns imported CPU model/image data. `ModelAssetCache` uses explicit byte/count budgets and generational handles; the renderer does not yet upload these models. `AsyncModelLoader` has bounded request and completion queues and drops decoded results if its consumer has been destroyed, then joins its worker on shutdown. The current forest texture path below still follows its existing synchronous upload lifecycle.
+## Vulkan and GPU ownership
 
-`VulkanContext` owns the instance, surface, debug messenger, logical device, and an `Arc<ValidationState>`. The callback's user pointer refers to that allocation; it remains alive through `vkDestroyDebugUtilsMessengerEXT`. The assets crate owns decoded CPU mip chains in `AssetManager`; the static renderer loads one keyed texture, uploads it, then drops that temporary CPU cache. Core `Scene` values own mesh handles and transforms until `ForestScene` is dropped. The current transforms are resolved into vertex positions and generated ground/prism normals before a device-local upload. `SwapchainState` owns the swapchain loader, forest pipeline, device-local vertex/index buffers, and other swapchain-dependent objects. It allocates one depth image/view per swapchain image; that depth target is reused only after the image's previous submission fence is waited. `ForestScene` owns the sampled forest texture image, memory, view, linear repeat sampler and mip count, as well as one host-visible camera uniform buffer and descriptor set per frame in flight. Texture mip levels are packed into one temporary host-visible staging buffer, copied during initialization, then transitioned to shader-read-only; staging memory is released after the graphics queue is idle. Descriptor binding 1 references the scene texture for all frame slots. Directional-light and ambient values are static shader constants, so they require no extra GPU allocation or per-frame update. The current frame fence is waited before the matching camera buffer is mapped and updated; non-coherent memory is flushed before unmapping. `VulkanRenderer` declares the swapchain state before the context so Rust drops it first; `SwapchainState::drop` waits for device idle and destroys synchronization, command pool, framebuffers, scene pipeline, descriptor pool/layouts, uniforms, texture sampler/view/image/memory and mesh buffers, depth views/images, color image views, render pass, and swapchain in dependency-safe order.
+- `VulkanContext` owns the Vulkan entry/instance, surface, debug messenger/state, physical/logical device, and queue selection. Validation callback state is reference-counted and remains alive through debug-messenger destruction.
+- `VulkanRenderer` owns `SwapchainState` and `VulkanContext`. `SwapchainState` owns swapchain images/views, per-image depth/HDR resources, per-frame shadow targets, render passes, `ForestScene`, tone-map pass, framebuffers, command resources, semaphores, fences, and in-flight image tracking.
+- `ForestScene` owns the GPU model cache, model/ground/environment textures, material descriptors, scene uniform buffers, pipelines, and static placements. The GPU cache uses generation-checked handles and an estimated 256 MiB resident model-buffer/texture budget.
+- `BufferAllocation`, `TextureResource`, `DepthAttachment`, `HdrTarget`, `ShadowTarget`, and tone-map resources own their Vulkan allocation and destroy it through `Drop`. The owning renderer waits before resources that may be in use are destroyed.
+- CPU import and Vulkan upload are separate modules. Temporary staging buffers are freed after upload queue completion. Current texture/model upload paths use queue waits; final shutdown and swapchain recreation may wait for device idle.
+- The renderer keeps persistent asset caches inside the swapchain-owned scene. A nonzero-size resize can therefore rebuild the scene and reimport/reupload assets; this is safe for the current test app but causes an avoidable hitch and must be separated before runtime streaming.
 
-Swapchain images are owned by the presentation system and are never freed directly. Image views, framebuffers, command pools, semaphores, fences, render pass, and swapchain are explicitly destroyed by their owner. Partial initialization is handled by initializing resource state to null handles and draining only successfully created objects.
+## Current budgets and measured residency
 
-## Unsafe boundaries
+Default model import limits include 256 MiB per-model combined CPU import memory, 2,000,000 vertices, and 6,000,000 indices. The GPU model cache is capped at 32 models and 256 MiB of estimated resident buffers/texture mip payload. CPU PNG texture and model cache budgets are configurable but are not a single unified registry budget.
 
-Unsafe code is limited to Vulkan FFI and native handle interop. Each call documents the handle validity, lifetime, and synchronization assumptions at the call site. The debug callback copies Vulkan's temporary message into owned text and does not retain callback data pointers. Its user pointer is the stable `Arc` allocation described above. No unsafe code is exposed through the public API.
+At the audit run, the renderer logged 138,377,796 bytes for model GPU resources, 16,777,212 bytes for ground GPU resources, 22,850,224 bytes for environment GPU mip/LUT payload, and 45,700,448 retained CPU environment bytes. Render targets, shadow images, driver allocations, staging peaks, and allocator overhead are outside those logged payload counts; they are not total process/GPU-memory figures.
 
-## Deferred allocator decisions
+## Unsafe and synchronization boundaries
 
-The demo creates device-local vertex/index and texture allocations, plus temporary host-visible staging allocations. It prefers coherent host memory and flushes the whole mapped allocation when only non-coherent memory is available. These static allocations do not justify `gpu-allocator` or a custom suballocator yet; see [Decision 0005](../decisions/0005-static-mesh-memory.md). The swapchain waits for device idle before destroying scene resources, which is simple and safe for initialization/resize but can stall. Dynamic asset and world resources will need fence-based retirement before memory is reclaimed.
+Unsafe code is concentrated in Vulkan FFI/native-handle interop. Call-site comments record handle and synchronization assumptions. A frame's uniform is written after its in-flight fence is waited. Swapchain images are presentation-owned and not destroyed directly. Validation logs zero warnings/errors in the audit capture and `Drop` releases renderer before the window.
+
+## Required future ownership changes
+
+Before phases 4–6, unify asset identity and unload semantics without merging CPU and GPU ownership. ECS components should store stable asset handles, never GPU pointers. The Vulkan backend should retire resources only after the last referencing fence/timeline value signals; ordinary streaming should not use `device_wait_idle`. Swapchain resize must not discard unrelated world/model resources. See the ownership diagram and rules in the Master Architecture.
